@@ -16,8 +16,50 @@ jobs:
       with:
         xcode-version: latest
 
-    - name: Build Project
+    - name: Build and Package IPA
       run: |
-        mkdir -p LeanIPTV.xcodeproj
-        swiftc -parse-as-library -emit-library -module-name LeanIPTV ContentView.swift LeanIPTVApp.swift -sdk $(xcrun --show-sdk-path) -target arm64-apple-ios15.0 || true
-        echo "Cloud build script initialized"
+        # Create a basic Xcode project structure via command line for compilation
+        swiftc -parse-as-library -emit-library -module-name LeanIPTV ContentView.swift LeanIPTVApp.swift -sdk $(xcrun --show-sdk-path) -target arm64-apple-ios15.0 -o libLeanIPTV.dylib
+        
+        # Create Payload structure for AltStore
+        mkdir -p Payload
+        mkdir -p Payload/LeanIPTV.app
+        
+        # Move binaries into the app bundle package structure
+        mv libLeanIPTV.dylib Payload/LeanIPTV.app/LeanIPTV
+        
+        # Generate a minimal Info.plist required for iOS/AltStore recognition
+        cat << 'EOF' > Payload/LeanIPTV.app/Info.plist
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+            <key>CFBundleIdentifier</key>
+            <string>com.lean.iptv</string>
+            <key>CFBundleName</key>
+            <string>LeanIPTV</string>
+            <key>CFBundleExecutable</key>
+            <string>LeanIPTV</string>
+            <key>CFBundleVersion</key>
+            <string>1.0</string>
+            <key>CFBundleShortVersionString</key>
+            <string>1.0</string>
+            <key>MinimumOSVersion</key>
+            <string>15.0</string>
+            <key>UIDeviceFamily</key>
+            <array>
+                <integer>1</integer>
+                <integer>2</integer>
+            </array>
+        </dict>
+        </plist>
+        EOF
+
+        # Compress into a sideload-ready IPA
+        zip -r LeanIPTV.app.ipa Payload
+        
+    - name: Upload IPA Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: LeanIPTV-IPA
+        path: LeanIPTV.app.ipa
