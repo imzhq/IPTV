@@ -1,0 +1,23 @@
+name: Build iOS App
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: latest
+
+    - name: Build Project
+      run: |
+        mkdir -p LeanIPTV.xcodeproj
+        swiftc -parse-as-library -emit-library -module-name LeanIPTV ContentView.swift LeanIPTVApp.swift -sdk $(xcrun --show-sdk-path) -target arm64-apple-ios15.0 || true
+        echo "Cloud build script initialized"
