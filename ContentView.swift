@@ -5,6 +5,22 @@ struct Category: Codable, Identifiable {
     let category_id: String
     let category_name: String
     var id: String { category_id }
+    
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        category_name = try container.decode(String.self, forKey: .category_name)
+        if let strID = try? container.decode(String.self, forKey: .category_id) {
+            category_id = strID
+        } else if let intID = try? container.decode(Int.self, forKey: .category_id) {
+            category_id = String(intID)
+        } else {
+            category_id = ""
+        }
+    }
+    
+    enum CodingKeys: String, CodingKey {
+        case category_id, category_name
+    }
 }
 
 struct LiveStream: Codable, Identifiable {
@@ -17,6 +33,37 @@ struct LiveStream: Codable, Identifiable {
     let container_extension: String?
     
     var id: Int { stream_id }
+    
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        num = try container.decodeIfPresent(Int.self, forKey: .num)
+        name = try container.decode(String.self, forKey: .name)
+        stream_type = try container.decodeIfPresent(String.self, forKey: .stream_type)
+        
+        if let intID = try? container.decode(Int.self, forKey: .stream_id) {
+            stream_id = intID
+        } else if let strID = try? container.decode(String.self, forKey: .stream_id), let parsed = Int(strID) {
+            stream_id = parsed
+        } else {
+            stream_id = 0
+        }
+        
+        stream_icon = try container.decodeIfPresent(String.self, forKey: .stream_icon)
+        
+        if let strCat = try? container.decode(String.self, forKey: .category_id) {
+            category_id = strCat
+        } else if let intCat = try? container.decode(Int.self, forKey: .category_id) {
+            category_id = String(intCat)
+        } else {
+            category_id = nil
+        }
+        
+        container_extension = try container.decodeIfPresent(String.self, forKey: .container_extension)
+    }
+    
+    enum CodingKeys: String, CodingKey {
+        case num, name, stream_type, stream_id, stream_icon, category_id, container_extension
+    }
 }
 
 struct SeriesItem: Codable, Identifiable {
@@ -27,6 +74,34 @@ struct SeriesItem: Codable, Identifiable {
     let category_id: String?
     
     var id: Int { series_id }
+    
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        num = try container.decodeIfPresent(Int.self, forKey: .num)
+        name = try container.decode(String.self, forKey: .name)
+        
+        if let intID = try? container.decode(Int.self, forKey: .series_id) {
+            series_id = intID
+        } else if let strID = try? container.decode(String.self, forKey: .series_id), let parsed = Int(strID) {
+            series_id = parsed
+        } else {
+            series_id = 0
+        }
+        
+        cover = try container.decodeIfPresent(String.self, forKey: .cover)
+        
+        if let strCat = try? container.decode(String.self, forKey: .category_id) {
+            category_id = strCat
+        } else if let intCat = try? container.decode(Int.self, forKey: .category_id) {
+            category_id = String(intCat)
+        } else {
+            category_id = nil
+        }
+    }
+    
+    enum CodingKeys: String, CodingKey {
+        case num, name, series_id, cover, category_id
+    }
 }
 
 struct Episode: Codable, Identifiable {
@@ -34,6 +109,25 @@ struct Episode: Codable, Identifiable {
     let episode_num: Int
     let title: String
     let container_extension: String?
+    
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        title = try container.decode(String.self, forKey: .title)
+        episode_num = try container.decodeIfPresent(Int.self, forKey: .episode_num) ?? 1
+        container_extension = try container.decodeIfPresent(String.self, forKey: .container_extension)
+        
+        if let strID = try? container.decode(String.self, forKey: .id) {
+            id = strID
+        } else if let intID = try? container.decode(Int.self, forKey: .id) {
+            id = String(intID)
+        } else {
+            id = UUID().uuidString
+        }
+    }
+    
+    enum CodingKeys: String, CodingKey {
+        case id, episode_num, title, container_extension
+    }
 }
 
 struct SeriesDetail: Codable {
@@ -45,7 +139,7 @@ struct ContentView: View {
     @AppStorage("username") private var username: String = ""
     @AppStorage("password") private var password: String = ""
     
-    @State private var selectedTab: Int = 0 // 0: Live, 1: Series
+    @State private var selectedTab: Int = 0
     @State private var liveCategories: [Category] = []
     @State private var seriesCategories: [Category] = []
     @State private var liveStreams: [LiveStream] = []
@@ -157,7 +251,7 @@ struct LoginView: View {
                 .font(.largeTitle)
                 .bold()
             
-            TextField("Server URL (e.g., http://line.provider.com:8080)", text: $serverURL)
+            TextField("Server URL", text: $serverURL)
                 .textFieldStyle(RoundedBorderTextFieldStyle())
                 .autocapitalization(.none)
                 .disableAutocorrection(true)
