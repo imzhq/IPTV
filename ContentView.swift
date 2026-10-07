@@ -34,8 +34,6 @@ struct Episode: Codable, Identifiable {
     let episode_num: Int
     let title: String
     let container_extension: String?
-    
-    var id: String { id }
 }
 
 struct SeriesDetail: Codable {
@@ -68,9 +66,6 @@ struct ContentView: View {
                     }
                     .pickerStyle(SegmentedPickerStyle())
                     .padding()
-                    .onChange(of: selectedTab) { _ in
-                        // Switch contexts if needed
-                    }
                     
                     if isLoading {
                         Spacer()
@@ -129,21 +124,18 @@ struct ContentView: View {
         
         isLoading = true
         
-        // Fetch Live Categories
         URLSession.shared.dataTask(with: liveCatURL) { data, _, _ in
             if let data = data, let decoded = try? JSONDecoder().decode([Category].self, from: data) {
                 DispatchQueue.main.async { self.liveCategories = decoded }
             }
         }.resume()
         
-        // Fetch Live Streams
         URLSession.shared.dataTask(with: liveChanURL) { data, _, _ in
             if let data = data, let decoded = try? JSONDecoder().decode([LiveStream].self, from: data) {
                 DispatchQueue.main.async { self.liveStreams = decoded }
             }
         }.resume()
         
-        // Fetch Series Categories
         URLSession.shared.dataTask(with: seriesCatURL) { data, _, _ in
             DispatchQueue.main.async { self.isLoading = false }
             if let data = data, let decoded = try? JSONDecoder().decode([Category].self, from: data) {
