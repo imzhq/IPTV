@@ -5,7 +5,7 @@ on:
     branches: [ main ]
 
 jobs:
-  build:
+_build:
     runs-on: macos-latest
     steps:
     - name: Checkout code
@@ -16,19 +16,14 @@ jobs:
       with:
         xcode-version: latest
 
-    - name: Build and Package IPA
+    - name: Package App Bundle
       run: |
-        # Create a basic Xcode project structure via command line for compilation
-        swiftc -parse-as-library -emit-library -module-name LeanIPTV ContentView.swift LeanIPTVApp.swift -sdk $(xcrun --show-sdk-path) -target arm64-apple-ios15.0 -o libLeanIPTV.dylib
-        
-        # Create Payload structure for AltStore
-        mkdir -p Payload
         mkdir -p Payload/LeanIPTV.app
         
-        # Move binaries into the app bundle package structure
-        mv libLeanIPTV.dylib Payload/LeanIPTV.app/LeanIPTV
+        # Compile direct Swift source into an executable binary
+        swiftc ContentView.swift LeanIPTVApp.swift -o Payload/LeanIPTV.app/LeanIPTV -target arm64-apple-ios15.0 -sdk $(xcrun --show-sdk-path)
         
-        # Generate a minimal Info.plist required for iOS/AltStore recognition
+        # Generate Info.plist for AltStore
         cat << 'EOF' > Payload/LeanIPTV.app/Info.plist
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -55,7 +50,7 @@ jobs:
         </plist>
         EOF
 
-        # Compress into a sideload-ready IPA
+        # Create IPA package
         zip -r LeanIPTV.app.ipa Payload
         
     - name: Upload IPA Artifact
