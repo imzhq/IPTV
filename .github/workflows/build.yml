@@ -20,8 +20,11 @@ jobs:
       run: |
         mkdir -p Payload/LeanIPTV.app
         
-        # Compile direct Swift source into an executable binary
-        swiftc ContentView.swift LeanIPTVApp.swift -o Payload/LeanIPTV.app/LeanIPTV -target arm64-apple-ios15.0 -sdk $(xcrun --show-sdk-path)
+        # Explicitly locate the iPhoneOS SDK path to resolve standard library loading
+        IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+        
+        # Compile direct Swift source using the correct iOS SDK
+        swiftc ContentView.swift LeanIPTVApp.swift -o Payload/LeanIPTV.app/LeanIPTV -target arm64-apple-ios15.0 -sdk $IOS_SDK
         
         # Generate Info.plist for AltStore
         cat << 'EOF' > Payload/LeanIPTV.app/Info.plist
