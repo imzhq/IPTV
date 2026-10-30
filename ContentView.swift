@@ -361,7 +361,7 @@ struct ChannelListView: View {
     }
 }
 
-// MARK: - Player (auto catch-up to live, no pauses, only on a good connection)
+// MARK: - Player (auto catch-up to live, with a temporary debug line)
 
 struct PlayerView: View {
     let channel: LiveChannel
@@ -370,10 +370,9 @@ struct PlayerView: View {
     @State private var catchingUp = false
     @State private var showBanner = false
     @State private var noticeShown = false
+    @State private var debugText = "measuring..."
 
-    private let maxDelay: Double = 20        // start catching up when further behind than this
-    private let targetDelay: Double = 10     // stop catching up at this delay
-    private let catchUpRate: Float = 1.15    // playback speed while catching up
+    private let catchUpRate: Float = 1.25    // playback speed while catching up
     private let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
     var body: some View {
@@ -397,14 +396,41 @@ struct PlayerView: View {
                     .padding(.top, 12)
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
+
+            // TEMPORARY debug line (we remove this once testing is done)
+            VStack {
+                Spacer()
+                HStack {
+                    Text(debugText)
+                        .font(.caption2)
+                        .padding(6)
+                        .background(Color.black.opacity(0.7))
+                        .foregroundColor(.yellow)
+                        .cornerRadius(6)
+                    Spacer()
+                }
+                .padding(.bottom, 60)
+                .padding(.horizontal, 8)
+            }
         }
         .navigationBarTitle(channel.name, displayMode: .inline)
         .navigationBarHidden(false)
         .onAppear {
             guard let url = url else { return }
+
+            // Fixes missing sound: play audio even with the silent switch on
+            do {
+                try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
+                try AVAudioSession.sharedInstance().setActive(true)
+            } catch {
+                print("Audio session error: \(error)")
+            }
+
             let item = AVPlayerItem(url: url)
             item.audioTimePitchAlgorithm = .timeDomain   // keeps voices natural when sped up
             let p = AVPlayer(playerItem: item)
+            p.isMuted = false
+            p.volume = 1.0
             player = p
             p.play()
         }
@@ -420,17 +446,30 @@ struct PlayerView: View {
 
     private func tick() {
         guard let p = player, let item = p.currentItem else { return }
-        if p.timeControlStatus == .paused { catchingUp = false; return }   // respect the user pausing
-        guard let edge = liveEdge() else { return }
+        guard let edge = liveEdge() else { debugText = "No live edge info"; return }
 
         let delay = max(0, edge - CMTimeGetSeconds(p.currentTime()))
+        let floorSecs = floorOffset(item)
+        let target = max(floorSecs * 0.5, 4)
+        let good = connectionIsGood(item)
+
+        var ratio = 0.0
+        if let ev = item.accessLog()?.events.last, ev.indicatedBitrate > 0 {
+            ratio = ev.observedBitrate / ev.indicatedBitrate
+        }
+        let ratioText = String(format: "%.1f", ratio)
+        let rateText = String(format: "%.2f", Double(p.rate))
+        let goodText = good ? "GOOD" : "not good"
+        debugText = "behind edge \(Int(delay))s | floor \(Int(floorSecs))s | target \(Int(target))s | speed x\(ratioText) | \(goodText) | rate \(rateText)"
+
+        if p.timeControlStatus == .paused { catchingUp = false; return }   // respect the user pausing
 
         if catchingUp {
-            if delay <= targetDelay || !connectionIsGood(item) {
+            if delay <= target || shouldBackOff(item) {
                 p.rate = 1.0
                 catchingUp = false
             }
-        } else if delay > maxDelay && connectionIsGood(item) {
+        } else if delay > target + 6 && good {
             catchingUp = true
             p.rate = catchUpRate
             showNotice()
@@ -443,6 +482,11 @@ struct PlayerView: View {
         return CMTimeGetSeconds(CMTimeRangeGetEnd(range))
     }
 
+    private func floorOffset(_ item: AVPlayerItem) -> Double {
+        let t = item.recommendedTimeOffsetFromLive
+        return t.isNumeric ? max(CMTimeGetSeconds(t), 2) : 12
+    }
+
     private func connectionIsGood(_ item: AVPlayerItem) -> Bool {
         guard item.isPlaybackLikelyToKeepUp,
               let ev = item.accessLog()?.events.last else { return false }
@@ -450,6 +494,11 @@ struct PlayerView: View {
         let indicated = ev.indicatedBitrate
         let fastEnough = indicated > 0 ? observed >= indicated * 2 : observed >= 6_000_000
         return fastEnough && bufferedAhead(item) >= 4
+    }
+
+    // While catching up the buffer shrinks, so stop if it gets too thin
+    private func shouldBackOff(_ item: AVPlayerItem) -> Bool {
+        return !item.isPlaybackLikelyToKeepUp || bufferedAhead(item) < 2
     }
 
     private func bufferedAhead(_ item: AVPlayerItem) -> Double {
