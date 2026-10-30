@@ -38,6 +38,8 @@ jobs:
             <string>LeanIPTV</string>
             <key>CFBundleExecutable</key>
             <string>LeanIPTV</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
             <key>CFBundleVersion</key>
             <string>1.0</string>
             <key>CFBundleShortVersionString</key>
@@ -49,6 +51,13 @@ jobs:
                 <integer>1</integer>
                 <integer>2</integer>
             </array>
+            <key>UILaunchScreen</key>
+            <dict/>
+            <key>NSAppTransportSecurity</key>
+            <dict>
+                <key>NSAllowsArbitraryLoads</key>
+                <true/>
+            </dict>
         </dict>
         </plist>
         EOF
