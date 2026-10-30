@@ -3,6 +3,7 @@ name: Build iOS App
 on:
   push:
     branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -16,55 +17,34 @@ jobs:
       with:
         xcode-version: latest
 
-    - name: Package App Bundle
-      run: |
-        mkdir -p Payload/LeanIPTV.app
-        
-        # Explicitly locate the iPhoneOS SDK path to resolve standard library loading
-        IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-        
-        # Compile direct Swift source using the correct iOS SDK
-        swiftc ContentView.swift LeanIPTVApp.swift -o Payload/LeanIPTV.app/LeanIPTV -target arm64-apple-ios15.0 -sdk $IOS_SDK
-        
-        # Generate Info.plist for AltStore
-        cat << 'EOF' > Payload/LeanIPTV.app/Info.plist
-        <?xml version="1.0" encoding="UTF-8"?>
-        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        <plist version="1.0">
-        <dict>
-            <key>CFBundleIdentifier</key>
-            <string>com.lean.iptv</string>
-            <key>CFBundleName</key>
-            <string>LeanIPTV</string>
-            <key>CFBundleExecutable</key>
-            <string>LeanIPTV</string>
-            <key>CFBundlePackageType</key>
-            <string>APPL</string>
-            <key>CFBundleVersion</key>
-            <string>1.0</string>
-            <key>CFBundleShortVersionString</key>
-            <string>1.0</string>
-            <key>MinimumOSVersion</key>
-            <string>15.0</string>
-            <key>UIDeviceFamily</key>
-            <array>
-                <integer>1</integer>
-                <integer>2</integer>
-            </array>
-            <key>UILaunchScreen</key>
-            <dict/>
-            <key>NSAppTransportSecurity</key>
-            <dict>
-                <key>NSAllowsArbitraryLoads</key>
-                <true/>
-            </dict>
-        </dict>
-        </plist>
-        EOF
+    - name: Install XcodeGen
+      run: brew install xcodegen
 
-        # Create IPA package
+    - name: Generate project and install VLC
+      run: |
+        xcodegen generate
+        pod install
+
+    - name: Build app (unsigned)
+      run: |
+        xcodebuild \
+          -workspace LeanIPTV.xcworkspace \
+          -scheme LeanIPTV \
+          -configuration Release \
+          -sdk iphoneos \
+          -destination 'generic/platform=iOS' \
+          -derivedDataPath build \
+          CODE_SIGNING_ALLOWED=NO \
+          CODE_SIGNING_REQUIRED=NO \
+          CODE_SIGN_IDENTITY="" \
+          build
+
+    - name: Package IPA
+      run: |
+        mkdir -p Payload
+        cp -R build/Build/Products/Release-iphoneos/LeanIPTV.app Payload/
         zip -r LeanIPTV.app.ipa Payload
-        
+
     - name: Upload IPA Artifact
       uses: actions/upload-artifact@v4
       with:
