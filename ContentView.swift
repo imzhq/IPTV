@@ -32,7 +32,6 @@ class IPTVViewModel: ObservableObject {
             self.errorMessage = nil
         }
         
-        // Construct the Xtream Codes API endpoint
         let endpoint = "\(baseURL)/player_api.php?username=\(username)&password=\(password)&action=get_live_categories"
         
         guard let url = URL(string: endpoint) else {
@@ -46,17 +45,14 @@ class IPTVViewModel: ObservableObject {
         do {
             let (data, response) = try await URLSession.shared.data(from: url)
             
-            // Check HTTP status code
             if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode != 200 {
                 print("❌ Server returned status code: \(httpResponse.statusCode)")
             }
             
-            // Print raw JSON to Xcode console for debugging
             if let jsonString = String(data: data, encoding: .utf8) {
                 print("RAW API RESPONSE: \(jsonString)")
             }
             
-            // Decode JSON array into our LiveCategory model
             let decodedCategories = try JSONDecoder().decode([LiveCategory].self, from: data)
             
             DispatchQueue.main.async {
@@ -77,7 +73,8 @@ class IPTVViewModel: ObservableObject {
 
 // MARK: - 3. SwiftUI Main View
 struct LiveCategoriesView: View {
-    @StateObject private model = IPTVViewModel()
+    // FIXED: Properly included 'var' here
+    @StateObject private var model = IPTVViewModel()
     @State private var selectedTab = 0
 
     var body: some View {
@@ -86,14 +83,12 @@ struct LiveCategoriesView: View {
                 Color.black.ignoresSafeArea()
                 
                 VStack(alignment: .leading, spacing: 16) {
-                    // Header
                     Text("Lean IPTV")
                         .font(.largeTitle)
                         .fontWeight(.bold)
                         .foregroundColor(.white)
                         .padding(.horizontal)
                     
-                    // Tab Selector Mock
                     HStack(spacing: 12) {
                         Button(action: { selectedTab = 0 }) {
                             Text("Live TV")
@@ -117,7 +112,6 @@ struct LiveCategoriesView: View {
                     }
                     .padding(.horizontal)
                     
-                    // Category Count / Status Header
                     HStack {
                         Text("LIVE CATEGORIES (\(model.categories.count))")
                             .font(.subheadline)
@@ -131,7 +125,6 @@ struct LiveCategoriesView: View {
                     }
                     .padding(.horizontal)
                     
-                    // Error Banner if any
                     if let error = model.errorMessage {
                         Text("Error: \(error)")
                             .font(.caption)
@@ -139,7 +132,6 @@ struct LiveCategoriesView: View {
                             .padding(.horizontal)
                     }
                     
-                    // Categories List
                     ScrollView {
                         LazyVStack(spacing: 12) {
                             ForEach(model.categories) { category in
@@ -164,7 +156,6 @@ struct LiveCategoriesView: View {
             }
             .navigationBarHidden(true)
             .task {
-                // Automatically fetch categories as soon as the view appears
                 await model.fetchLiveCategories()
             }
         }
