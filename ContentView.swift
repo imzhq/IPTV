@@ -1,5 +1,6 @@
 import SwiftUI
-import AVKit
+import AVFoundation
+import MobileVLCKit
 
 // MARK: - Models
 
@@ -157,11 +158,12 @@ class IPTVViewModel: ObservableObject {
         }
     }
 
-    // Try ".ts" instead of ".m3u8" if your provider doesn't serve HLS
+    // Raw .ts feed: VLC plays this directly, and it avoids the extra delay of the .m3u8 version.
+    // If a channel shows a black screen, try changing ".ts" to ".m3u8".
     func streamURL(for channel: LiveChannel) -> URL? {
         let u = username.trimmingCharacters(in: .whitespaces)
         let p = password.trimmingCharacters(in: .whitespaces)
-        return URL(string: "\(baseURL)/live/\(u)/\(p)/\(channel.id).m3u8")
+        return URL(string: "\(baseURL)/live/\(u)/\(p)/\(channel.id).ts")
     }
 
     func logout() {
@@ -361,163 +363,91 @@ struct ChannelListView: View {
     }
 }
 
-// MARK: - Player (auto catch-up to live, with a temporary debug line)
+// MARK: - VLC Player (low-latency)
+
+// Smaller number = closer to live but more risk of stuttering. 300–1500 is a sensible range.
+private let vlcCachingMs = 500
+
+final class VLCController: ObservableObject {
+    let player = VLCMediaPlayer()
+    private var started = false
+
+    func play(url: URL) {
+        guard !started else { return }
+        started = true
+        let media = VLCMedia(url: url)
+        media.addOption(":network-caching=\(vlcCachingMs)")
+        media.addOption(":live-caching=\(vlcCachingMs)")
+        media.addOption(":clock-jitter=0")
+        media.addOption(":clock-synchro=0")
+        player.media = media
+        player.play()
+    }
+
+    func stop() {
+        player.stop()
+        started = false
+    }
+}
+
+struct VLCSurface: UIViewRepresentable {
+    let controller: VLCController
+    let url: URL
+
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView()
+        view.backgroundColor = .black
+        controller.player.drawable = view
+        controller.play(url: url)
+        return view
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {}
+}
 
 struct PlayerView: View {
     let channel: LiveChannel
     let url: URL?
-    @State private var player: AVPlayer? = nil
-    @State private var catchingUp = false
-    @State private var showBanner = false
-    @State private var noticeShown = false
-    @State private var debugText = "measuring..."
 
-    private let catchUpRate: Float = 1.25    // playback speed while catching up
-    private let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
+    @StateObject private var controller = VLCController()
+    @State private var connecting = true
+    private let poll = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     var body: some View {
-        ZStack(alignment: .top) {
+        ZStack {
             Color.black.ignoresSafeArea()
-            if let player = player {
-                VideoPlayer(player: player)
+            if let url = url {
+                VLCSurface(controller: controller, url: url)
                     .ignoresSafeArea(edges: .bottom)
             } else {
                 Text("Could not build stream URL").foregroundColor(.red)
             }
 
-            if showBanner {
-                Text("Good connection — catching up to live")
-                    .font(.footnote.weight(.semibold))
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 8)
-                    .background(Color.black.opacity(0.75))
-                    .foregroundColor(.white)
-                    .cornerRadius(20)
-                    .padding(.top, 12)
-                    .transition(.move(edge: .top).combined(with: .opacity))
-            }
-
-            // TEMPORARY debug line (we remove this once testing is done)
-            VStack {
-                Spacer()
-                HStack {
-                    Text(debugText)
-                        .font(.caption2)
-                        .padding(6)
-                        .background(Color.black.opacity(0.7))
-                        .foregroundColor(.yellow)
-                        .cornerRadius(6)
-                    Spacer()
+            if connecting && url != nil {
+                VStack(spacing: 10) {
+                    ProgressView().scaleEffect(1.2)
+                    Text("Connecting...")
+                        .font(.subheadline)
+                        .foregroundColor(.gray)
                 }
-                .padding(.bottom, 60)
-                .padding(.horizontal, 8)
             }
         }
         .navigationBarTitle(channel.name, displayMode: .inline)
         .navigationBarHidden(false)
         .onAppear {
-            guard let url = url else { return }
-
-            // Fixes missing sound: play audio even with the silent switch on
+            // Play audio even with the silent switch on
             do {
                 try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
                 try AVAudioSession.sharedInstance().setActive(true)
             } catch {
                 print("Audio session error: \(error)")
             }
-
-            let item = AVPlayerItem(url: url)
-            item.audioTimePitchAlgorithm = .timeDomain   // keeps voices natural when sped up
-            let p = AVPlayer(playerItem: item)
-            p.isMuted = false
-            p.volume = 1.0
-            player = p
-            p.play()
         }
         .onDisappear {
-            player?.pause()
-            player = nil
-            catchingUp = false
+            controller.stop()
         }
-        .onReceive(timer) { _ in tick() }
-    }
-
-    // MARK: Catch-up logic (no seeking, so no pauses)
-
-    private func tick() {
-        guard let p = player, let item = p.currentItem else { return }
-        guard let edge = liveEdge() else { debugText = "No live edge info"; return }
-
-        let delay = max(0, edge - CMTimeGetSeconds(p.currentTime()))
-        let floorSecs = floorOffset(item)
-        let target = max(floorSecs * 0.5, 4)
-        let good = connectionIsGood(item)
-
-        var ratio = 0.0
-        if let ev = item.accessLog()?.events.last, ev.indicatedBitrate > 0 {
-            ratio = ev.observedBitrate / ev.indicatedBitrate
-        }
-        let ratioText = String(format: "%.1f", ratio)
-        let rateText = String(format: "%.2f", Double(p.rate))
-        let goodText = good ? "GOOD" : "not good"
-        debugText = "behind edge \(Int(delay))s | floor \(Int(floorSecs))s | target \(Int(target))s | speed x\(ratioText) | \(goodText) | rate \(rateText)"
-
-        if p.timeControlStatus == .paused { catchingUp = false; return }   // respect the user pausing
-
-        if catchingUp {
-            if delay <= target || shouldBackOff(item) {
-                p.rate = 1.0
-                catchingUp = false
-            }
-        } else if delay > target + 6 && good {
-            catchingUp = true
-            p.rate = catchUpRate
-            showNotice()
-        }
-    }
-
-    private func liveEdge() -> Double? {
-        guard let item = player?.currentItem,
-              let range = item.seekableTimeRanges.last?.timeRangeValue else { return nil }
-        return CMTimeGetSeconds(CMTimeRangeGetEnd(range))
-    }
-
-    private func floorOffset(_ item: AVPlayerItem) -> Double {
-        let t = item.recommendedTimeOffsetFromLive
-        return t.isNumeric ? max(CMTimeGetSeconds(t), 2) : 12
-    }
-
-    private func connectionIsGood(_ item: AVPlayerItem) -> Bool {
-        guard item.isPlaybackLikelyToKeepUp,
-              let ev = item.accessLog()?.events.last else { return false }
-        let observed = ev.observedBitrate
-        let indicated = ev.indicatedBitrate
-        let fastEnough = indicated > 0 ? observed >= indicated * 2 : observed >= 6_000_000
-        return fastEnough && bufferedAhead(item) >= 4
-    }
-
-    // While catching up the buffer shrinks, so stop if it gets too thin
-    private func shouldBackOff(_ item: AVPlayerItem) -> Bool {
-        return !item.isPlaybackLikelyToKeepUp || bufferedAhead(item) < 2
-    }
-
-    private func bufferedAhead(_ item: AVPlayerItem) -> Double {
-        let now = CMTimeGetSeconds(item.currentTime())
-        for value in item.loadedTimeRanges {
-            let r = value.timeRangeValue
-            let start = CMTimeGetSeconds(r.start)
-            let end = CMTimeGetSeconds(CMTimeRangeGetEnd(r))
-            if now >= start && now <= end { return end - now }
-        }
-        return 0
-    }
-
-    private func showNotice() {
-        guard !noticeShown else { return }
-        noticeShown = true
-        withAnimation { showBanner = true }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
-            withAnimation { showBanner = false }
+        .onReceive(poll) { _ in
+            if controller.player.isPlaying { connecting = false }
         }
     }
 }
