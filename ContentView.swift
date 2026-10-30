@@ -361,15 +361,23 @@ struct ChannelListView: View {
     }
 }
 
-// MARK: - Player
+// MARK: - Player (auto catch-up to live, no pauses, only on a good connection)
 
 struct PlayerView: View {
     let channel: LiveChannel
     let url: URL?
     @State private var player: AVPlayer? = nil
+    @State private var catchingUp = false
+    @State private var showBanner = false
+    @State private var noticeShown = false
+
+    private let maxDelay: Double = 20        // start catching up when further behind than this
+    private let targetDelay: Double = 10     // stop catching up at this delay
+    private let catchUpRate: Float = 1.15    // playback speed while catching up
+    private let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
     var body: some View {
-        ZStack {
+        ZStack(alignment: .top) {
             Color.black.ignoresSafeArea()
             if let player = player {
                 VideoPlayer(player: player)
@@ -377,19 +385,90 @@ struct PlayerView: View {
             } else {
                 Text("Could not build stream URL").foregroundColor(.red)
             }
+
+            if showBanner {
+                Text("Good connection — catching up to live")
+                    .font(.footnote.weight(.semibold))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(Color.black.opacity(0.75))
+                    .foregroundColor(.white)
+                    .cornerRadius(20)
+                    .padding(.top, 12)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
         }
         .navigationBarTitle(channel.name, displayMode: .inline)
         .navigationBarHidden(false)
         .onAppear {
-            if let url = url {
-                let p = AVPlayer(url: url)
-                player = p
-                p.play()
-            }
+            guard let url = url else { return }
+            let item = AVPlayerItem(url: url)
+            item.audioTimePitchAlgorithm = .timeDomain   // keeps voices natural when sped up
+            let p = AVPlayer(playerItem: item)
+            player = p
+            p.play()
         }
         .onDisappear {
             player?.pause()
             player = nil
+            catchingUp = false
+        }
+        .onReceive(timer) { _ in tick() }
+    }
+
+    // MARK: Catch-up logic (no seeking, so no pauses)
+
+    private func tick() {
+        guard let p = player, let item = p.currentItem else { return }
+        if p.timeControlStatus == .paused { catchingUp = false; return }   // respect the user pausing
+        guard let edge = liveEdge() else { return }
+
+        let delay = max(0, edge - CMTimeGetSeconds(p.currentTime()))
+
+        if catchingUp {
+            if delay <= targetDelay || !connectionIsGood(item) {
+                p.rate = 1.0
+                catchingUp = false
+            }
+        } else if delay > maxDelay && connectionIsGood(item) {
+            catchingUp = true
+            p.rate = catchUpRate
+            showNotice()
+        }
+    }
+
+    private func liveEdge() -> Double? {
+        guard let item = player?.currentItem,
+              let range = item.seekableTimeRanges.last?.timeRangeValue else { return nil }
+        return CMTimeGetSeconds(CMTimeRangeGetEnd(range))
+    }
+
+    private func connectionIsGood(_ item: AVPlayerItem) -> Bool {
+        guard item.isPlaybackLikelyToKeepUp,
+              let ev = item.accessLog()?.events.last else { return false }
+        let observed = ev.observedBitrate
+        let indicated = ev.indicatedBitrate
+        let fastEnough = indicated > 0 ? observed >= indicated * 2 : observed >= 6_000_000
+        return fastEnough && bufferedAhead(item) >= 4
+    }
+
+    private func bufferedAhead(_ item: AVPlayerItem) -> Double {
+        let now = CMTimeGetSeconds(item.currentTime())
+        for value in item.loadedTimeRanges {
+            let r = value.timeRangeValue
+            let start = CMTimeGetSeconds(r.start)
+            let end = CMTimeGetSeconds(CMTimeRangeGetEnd(r))
+            if now >= start && now <= end { return end - now }
+        }
+        return 0
+    }
+
+    private func showNotice() {
+        guard !noticeShown else { return }
+        noticeShown = true
+        withAnimation { showBanner = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+            withAnimation { showBanner = false }
         }
     }
 }
