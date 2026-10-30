@@ -4,7 +4,7 @@ import SwiftUI
 struct LeanIPTVApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            LiveCategoriesView() // Updated from ContentView()
         }
     }
 }
