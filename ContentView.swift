@@ -795,6 +795,8 @@ struct PlayerView: View {
     @State private var playing = true
     @State private var elapsed = "0:00"
     @State private var total = "0:00"
+    
+    @Environment(\.presentationMode) var presentationMode
 
     private let steps = [300, 500, 800, 1200, 1500, 2000, 3000, 5000]
     private let poll = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
@@ -805,7 +807,7 @@ struct PlayerView: View {
 
             if url != nil {
                 VLCSurface(controller: controller, onReady: { startPlayback() })
-                    .ignoresSafeArea(edges: .bottom)
+                    .ignoresSafeArea()
                     .contentShape(Rectangle())
                     .onTapGesture { withAnimation { showControls.toggle() } }
             } else {
@@ -821,15 +823,35 @@ struct PlayerView: View {
                 }
             }
 
+            // Custom overlay controls (Top bar + Bottom controls) that fade together
             if showControls && url != nil {
                 VStack {
+                    // Custom Top Bar that cleanly collapses/fades away with screen taps
+                    HStack(spacing: 15) {
+                        Button(action: { presentationMode.wrappedValue.dismiss() }) {
+                            Image(systemName: "chevron.left")
+                                .font(.title3.weight(.semibold))
+                                .foregroundColor(.white)
+                        }
+                        
+                        Text(title)
+                            .font(.headline)
+                            .foregroundColor(.white)
+                            .lineLimit(1)
+                        
+                        Spacer()
+                    }
+                    .padding()
+                    .background(Color.black.opacity(0.65))
+                    
                     Spacer()
+                    
+                    // Bottom Controls Panel
                     controlsPanel
                 }
             }
         }
-        .navigationBarTitle(title, displayMode: .inline)
-        .navigationBarHidden(!showControls) // 👈 Automatically collapses header banner when controls fade out
+        .navigationBarHidden(true) // Hides system navigation bar completely so the custom header takes over
         .onAppear {
             do {
                 try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
