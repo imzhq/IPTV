@@ -10,6 +10,10 @@ targets:
     sources:
       - path: ContentView.swift
       - path: LeanIPTVApp.swift
+      - path: Models.swift
+      - path: Downloads.swift
+      - path: DownloadViews.swift
+      - path: Player.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.lean.iptv
