@@ -12,6 +12,14 @@ enum ContentKind: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+func symbolName(for kind: ContentKind) -> String {
+    switch kind {
+    case .live: return "play.fill"
+    case .movies: return "film"
+    case .series: return "tv"
+    }
+}
+
 struct IPTVCategory: Decodable, Identifiable {
     var id: String { categoryId }
     let categoryId: String
@@ -44,6 +52,7 @@ struct AnyKey: CodingKey {
 struct MediaItem: Decodable, Identifiable {
     let id: Int
     let name: String
+    let searchKey: String
     let icon: String?
     let ext: String
 
@@ -56,7 +65,9 @@ struct MediaItem: Decodable, Identifiable {
             return nil
         }
         id = Int(str("stream_id") ?? str("series_id") ?? "") ?? 0
-        name = str("name") ?? "Unknown"
+        let n = str("name") ?? "Unknown"
+        name = n
+        searchKey = n.lowercased()
         let ic = str("stream_icon") ?? str("cover")
         icon = (ic?.isEmpty ?? true) ? nil : ic
         ext = str("container_extension") ?? "mp4"
@@ -92,6 +103,11 @@ class IPTVViewModel: ObservableObject {
     @Published var isLoading = false
     @Published var errorMessage: String? = nil
 
+    // Whole-catalog cache used by the search box
+    @Published var library: [ContentKind: [MediaItem]] = [:]
+    @Published var libraryLoading: Set<ContentKind> = []
+    @Published var libraryError: String? = nil
+
     private var baseURL: String {
         var h = host.trimmingCharacters(in: .whitespacesAndNewlines)
         if !h.lowercased().hasPrefix("http") { h = "http://" + h }
@@ -113,8 +129,8 @@ class IPTVViewModel: ObservableObject {
         return comps.url
     }
 
-    private func fetch(_ url: URL) async throws -> Data {
-        var request = URLRequest(url: url, timeoutInterval: 25)
+    private func fetch(_ url: URL, timeout: TimeInterval = 25) async throws -> Data {
+        var request = URLRequest(url: url, timeoutInterval: timeout)
         request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
         let (data, response) = try await URLSession.shared.data(for: request)
         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
@@ -193,6 +209,27 @@ class IPTVViewModel: ObservableObject {
         }
     }
 
+    // Downloads the full list for a section once (no category filter) so it can be searched instantly
+    func loadLibrary(_ kind: ContentKind) async {
+        guard library[kind] == nil, !libraryLoading.contains(kind),
+              let url = makeURL(action: actions(for: kind).items) else { return }
+        libraryLoading.insert(kind)
+        libraryError = nil
+        defer { libraryLoading.remove(kind) }
+        do {
+            let data = try await fetch(url, timeout: 90)
+            // Decode off the main thread so the app doesn't freeze on big catalogs
+            let decoded = try await Task.detached(priority: .userInitiated) {
+                try JSONDecoder().decode([MediaItem].self, from: data)
+            }.value
+            library[kind] = decoded
+            print("✅ Search catalog for \(kind.rawValue): \(decoded.count) items")
+        } catch {
+            libraryError = "Could not load the search list: \(error.localizedDescription)"
+            print("❌ Library error: \(error)")
+        }
+    }
+
     func loadEpisodes(for series: MediaItem) async -> [Episode] {
         let extra = [URLQueryItem(name: "series_id", value: String(series.id))]
         guard let url = makeURL(action: "get_series_info", extra: extra) else { return [] }
@@ -251,6 +288,7 @@ class IPTVViewModel: ObservableObject {
         isLoggedIn = false
         categories = [:]
         items = []
+        library = [:]
     }
 }
 
@@ -336,26 +374,20 @@ struct LoginView: View {
     }
 }
 
-// MARK: - Home (Live TV / Movies / Series)
+// MARK: - Home (Live TV / Movies / Series + search)
 
 struct HomeView: View {
     @ObservedObject var model: IPTVViewModel
     @State private var kind: ContentKind = .live
+    @State private var query = ""
     @AppStorage("data_saver") private var dataSaver = true
 
     private var cats: [IPTVCategory] { model.categories[kind] ?? [] }
+    private var cleanQuery: String { query.trimmingCharacters(in: .whitespaces) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text("Lean IPTV")
-                    .font(.largeTitle).fontWeight(.bold)
-                    .foregroundColor(.white)
-                Spacer()
-                Button("Log out") { model.logout() }
-                    .foregroundColor(.red)
-            }
-            .padding(.horizontal)
+            header
 
             Picker("Section", selection: $kind) {
                 ForEach(ContentKind.allCases) { k in
@@ -364,6 +396,8 @@ struct HomeView: View {
             }
             .pickerStyle(SegmentedPickerStyle())
             .padding(.horizontal)
+
+            searchField
 
             if kind != .live {
                 Toggle(isOn: $dataSaver) {
@@ -377,6 +411,60 @@ struct HomeView: View {
                 .padding(.horizontal)
             }
 
+            if cleanQuery.isEmpty {
+                categoryList
+            } else {
+                SearchResultsView(model: model, kind: kind, query: cleanQuery)
+            }
+        }
+        .task(id: kind) {
+            if model.categories[kind] == nil {
+                await model.loadCategories(kind)
+            }
+        }
+        .onChange(of: kind) { _ in
+            query = ""
+        }
+        .onChange(of: query) { _ in
+            if !cleanQuery.isEmpty {
+                Task { await model.loadLibrary(kind) }
+            }
+        }
+    }
+
+    private var header: some View {
+        HStack {
+            Text("Lean IPTV")
+                .font(.largeTitle).fontWeight(.bold)
+                .foregroundColor(.white)
+            Spacer()
+            Button("Log out") { model.logout() }
+                .foregroundColor(.red)
+        }
+        .padding(.horizontal)
+    }
+
+    private var searchField: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass").foregroundColor(.gray)
+            TextField("Search all \(kind.rawValue.lowercased())", text: $query)
+                .autocapitalization(.none)
+                .disableAutocorrection(true)
+                .foregroundColor(.white)
+            if !query.isEmpty {
+                Button(action: { query = "" }) {
+                    Image(systemName: "xmark.circle.fill").foregroundColor(.gray)
+                }
+            }
+        }
+        .padding(10)
+        .background(Color.gray.opacity(0.2))
+        .cornerRadius(10)
+        .padding(.horizontal)
+    }
+
+    private var categoryList: some View {
+        VStack(alignment: .leading, spacing: 12) {
             Text("\(kind.rawValue.uppercased()) CATEGORIES (\(cats.count))")
                 .font(.subheadline)
                 .foregroundColor(.gray)
@@ -407,15 +495,92 @@ struct HomeView: View {
                 .padding(.horizontal)
             }
         }
-        .task(id: kind) {
-            if model.categories[kind] == nil {
-                await model.loadCategories(kind)
+    }
+}
+
+// MARK: - Search results (whole catalog)
+
+struct SearchResultsView: View {
+    @ObservedObject var model: IPTVViewModel
+    let kind: ContentKind
+    let query: String
+
+    @AppStorage("data_saver") private var dataSaver = true
+
+    private let maxResults = 300
+
+    // Every word you type must appear in the title, in any order
+    private var matches: [MediaItem] {
+        guard let all = model.library[kind] else { return [] }
+        let words = query.lowercased().split(separator: " ").map { String($0) }
+        guard !words.isEmpty else { return [] }
+        return all.filter { item in
+            if kind != .live && dataSaver {
+                let n = item.searchKey
+                if n.contains("4k") || n.contains("uhd") || n.contains("2160") { return false }
+            }
+            return words.allSatisfy { item.searchKey.contains($0) }
+        }
+    }
+
+    var body: some View {
+        let found = matches
+        let shown = Array(found.prefix(maxResults))
+
+        VStack(alignment: .leading, spacing: 10) {
+            if model.libraryLoading.contains(kind) {
+                HStack(spacing: 8) {
+                    ProgressView()
+                    Text("Loading the full list (first search only)...")
+                        .font(.caption).foregroundColor(.gray)
+                }
+                .padding(.horizontal)
+            } else if let error = model.libraryError, model.library[kind] == nil {
+                Text(error).font(.caption).foregroundColor(.red).padding(.horizontal)
+            } else {
+                Text(found.count > maxResults
+                     ? "\(found.count) RESULTS · showing the first \(maxResults), keep typing to narrow"
+                     : "\(found.count) RESULTS")
+                    .font(.caption)
+                    .foregroundColor(.gray)
+                    .padding(.horizontal)
+            }
+
+            ScrollView {
+                LazyVStack(spacing: 10) {
+                    ForEach(shown) { item in
+                        NavigationLink(destination: ItemDestination(model: model, kind: kind, item: item)) {
+                            MediaRow(name: item.name,
+                                     icon: item.icon,
+                                     symbol: symbolName(for: kind),
+                                     showIcon: kind == .live || !dataSaver)
+                        }
+                    }
+                }
+                .padding(.horizontal)
             }
         }
     }
 }
 
-// MARK: - Item list (channels / movies / series)
+// MARK: - Shared pieces
+
+struct ItemDestination: View {
+    @ObservedObject var model: IPTVViewModel
+    let kind: ContentKind
+    let item: MediaItem
+
+    var body: some View {
+        switch kind {
+        case .live:
+            PlayerView(title: item.name, url: model.liveURL(item), mode: .live)
+        case .movies:
+            PlayerView(title: item.name, url: model.movieURL(item), mode: .vod)
+        case .series:
+            EpisodeListView(model: model, series: item)
+        }
+    }
+}
 
 struct MediaRow: View {
     let name: String
@@ -445,6 +610,8 @@ struct MediaRow: View {
     }
 }
 
+// MARK: - Item list (one category)
+
 struct ItemListView: View {
     @ObservedObject var model: IPTVViewModel
     let kind: ContentKind
@@ -463,26 +630,6 @@ struct ItemListView: View {
         }
     }
 
-    private var symbol: String {
-        switch kind {
-        case .live: return "play.fill"
-        case .movies: return "film"
-        case .series: return "tv"
-        }
-    }
-
-    @ViewBuilder
-    private func destination(for item: MediaItem) -> some View {
-        switch kind {
-        case .live:
-            PlayerView(title: item.name, url: model.liveURL(item), mode: .live)
-        case .movies:
-            PlayerView(title: item.name, url: model.movieURL(item), mode: .vod)
-        case .series:
-            EpisodeListView(model: model, series: item)
-        }
-    }
-
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
@@ -494,7 +641,7 @@ struct ItemListView: View {
                 }
                 .padding(.horizontal)
 
-                TextField("Search", text: $query)
+                TextField("Search this category", text: $query)
                     .autocapitalization(.none)
                     .disableAutocorrection(true)
                     .padding(10)
@@ -510,10 +657,10 @@ struct ItemListView: View {
                 ScrollView {
                     LazyVStack(spacing: 10) {
                         ForEach(shown) { item in
-                            NavigationLink(destination: destination(for: item)) {
+                            NavigationLink(destination: ItemDestination(model: model, kind: kind, item: item)) {
                                 MediaRow(name: item.name,
                                          icon: item.icon,
-                                         symbol: symbol,
+                                         symbol: symbolName(for: kind),
                                          showIcon: kind == .live || !dataSaver)
                             }
                         }
