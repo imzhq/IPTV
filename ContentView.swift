@@ -806,10 +806,20 @@ struct PlayerView: View {
             Color.black.ignoresSafeArea()
 
             if url != nil {
+                // 1. Base Video Surface
                 VLCSurface(controller: controller, onReady: { startPlayback() })
                     .ignoresSafeArea()
+
+                // 2. Explicit Tap-Catcher Overlay (solves VLC swallowing touch events)
+                Rectangle()
+                    .fill(Color.clear)
                     .contentShape(Rectangle())
-                    .onTapGesture { withAnimation { showControls.toggle() } }
+                    .ignoresSafeArea()
+                    .onTapGesture {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            showControls.toggle()
+                        }
+                    }
             } else {
                 Text("Could not build stream URL").foregroundColor(.red)
             }
@@ -823,10 +833,10 @@ struct PlayerView: View {
                 }
             }
 
-            // Custom overlay controls (Top bar + Bottom controls) that fade together
+            // 3. UI Controls Overlay (Top Header + Bottom Panel)
             if showControls && url != nil {
                 VStack {
-                    // Custom Top Bar that cleanly collapses/fades away with screen taps
+                    // Custom Header Bar that collapses when controls hide
                     HStack(spacing: 15) {
                         Button(action: { presentationMode.wrappedValue.dismiss() }) {
                             Image(systemName: "chevron.left")
@@ -849,9 +859,10 @@ struct PlayerView: View {
                     // Bottom Controls Panel
                     controlsPanel
                 }
+                .transition(.opacity)
             }
         }
-        .navigationBarHidden(true) // Hides system navigation bar completely so the custom header takes over
+        .navigationBarHidden(true) // Disable system navigation bar completely
         .onAppear {
             do {
                 try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
