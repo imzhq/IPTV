@@ -1,26 +1,10 @@
 import SwiftUI
-import UIKit
 import AVFoundation
 import MobileVLCKit
 
 // MARK: - Models
 
-enum ContentKind: String, CaseIterable, Identifiable {
-    case live = "Live TV"
-    case movies = "Movies"
-    case series = "Series"
-    var id: String { rawValue }
-}
-
-func symbolName(for kind: ContentKind) -> String {
-    switch kind {
-    case .live: return "play.fill"
-    case .movies: return "film"
-    case .series: return "tv"
-    }
-}
-
-struct IPTVCategory: Decodable, Identifiable {
+struct LiveCategory: Decodable, Identifiable {
     var id: String { categoryId }
     let categoryId: String
     let categoryName: String
@@ -32,68 +16,39 @@ struct IPTVCategory: Decodable, Identifiable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        // Some providers send category_id as a number, others as a string
         if let s = try? c.decode(String.self, forKey: .categoryId) {
             categoryId = s
-        } else if let i = try? c.decode(Int.self, forKey: .categoryId) {
-            categoryId = String(i)
         } else {
-            categoryId = "0"
+            categoryId = String(try c.decode(Int.self, forKey: .categoryId))
         }
         categoryName = (try? c.decode(String.self, forKey: .categoryName)) ?? "Unnamed"
     }
 }
 
-struct AnyKey: CodingKey {
-    var stringValue: String
-    var intValue: Int? { nil }
-    init?(stringValue: String) { self.stringValue = stringValue }
-    init?(intValue: Int) { return nil }
-}
-
-// Robust decoder supporting live, movies, and series ID variants
-struct MediaItem: Decodable, Identifiable {
+struct LiveChannel: Decodable, Identifiable {
     let id: Int
     let name: String
-    let searchKey: String
     let icon: String?
-    let ext: String
+
+    enum CodingKeys: String, CodingKey {
+        case id = "stream_id"
+        case name
+        case icon = "stream_icon"
+    }
 
     init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: AnyKey.self)
-        func str(_ k: String) -> String? {
-            guard let key = AnyKey(stringValue: k) else { return nil }
-            if let s = try? c.decode(String.self, forKey: key) { return s }
-            if let i = try? c.decode(Int.self, forKey: key) { return String(i) }
-            return nil
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if let i = try? c.decode(Int.self, forKey: .id) {
+            id = i
+        } else if let s = try? c.decode(String.self, forKey: .id), let i = Int(s) {
+            id = i
+        } else {
+            id = 0
         }
-        
-        // Check all potential ID keys used across live, movies, and series endpoints
-        let rawID = str("stream_id") ?? str("series_id") ?? str("num") ?? "0"
-        id = Int(rawID) ?? 0
-        
-        let n = str("name") ?? str("title") ?? "Unknown"
-        name = n
-        searchKey = n.lowercased()
-        
-        let ic = str("stream_icon") ?? str("cover") ?? str("movie_image")
-        icon = (ic?.isEmpty ?? true) ? nil : ic
-        ext = str("container_extension") ?? str("direct_source") ?? "mp4"
+        name = (try? c.decode(String.self, forKey: .name)) ?? "Unknown"
+        icon = try? c.decodeIfPresent(String.self, forKey: .icon)
     }
-}
-
-struct Episode: Identifiable {
-    let id: String
-    let season: Int
-    let number: Int
-    let title: String
-    let ext: String
-}
-
-private func intFrom(_ any: Any?, default def: Int) -> Int {
-    if let i = any as? Int { return i }
-    if let s = any as? String, let i = Int(s) { return i }
-    if let d = any as? Double { return Int(d) }
-    return def
 }
 
 // MARK: - ViewModel
@@ -104,17 +59,13 @@ class IPTVViewModel: ObservableObject {
     @Published var username: String = UserDefaults.standard.string(forKey: "iptv_user") ?? ""
     @Published var password: String = UserDefaults.standard.string(forKey: "iptv_pass") ?? ""
 
-    @Published var categories: [ContentKind: [IPTVCategory]] = [:]
-    @Published var items: [MediaItem] = []
+    @Published var categories: [LiveCategory] = []
+    @Published var channels: [LiveChannel] = []
     @Published var isLoggedIn = false
     @Published var isLoading = false
     @Published var errorMessage: String? = nil
 
-    // Whole-catalog cache used by the search box
-    @Published var library: [ContentKind: [MediaItem]] = [:]
-    @Published var libraryLoading: Set<ContentKind> = []
-    @Published var libraryError: String? = nil
-
+    // Normalised server address, e.g. "http://line.example.top" or "http://host:8080"
     private var baseURL: String {
         var h = host.trimmingCharacters(in: .whitespacesAndNewlines)
         if !h.lowercased().hasPrefix("http") { h = "http://" + h }
@@ -122,22 +73,20 @@ class IPTVViewModel: ObservableObject {
         return h
     }
 
-    private var u: String { username.trimmingCharacters(in: .whitespaces) }
-    private var p: String { password.trimmingCharacters(in: .whitespaces) }
-
     private func makeURL(action: String? = nil, extra: [URLQueryItem] = []) -> URL? {
         guard var comps = URLComponents(string: baseURL + "/player_api.php") else { return nil }
-        var q = [
-            URLQueryItem(name: "username", value: u),
-            URLQueryItem(name: "password", value: p)
+        var items = [
+            URLQueryItem(name: "username", value: username.trimmingCharacters(in: .whitespaces)),
+            URLQueryItem(name: "password", value: password.trimmingCharacters(in: .whitespaces))
         ]
-        if let action = action { q.append(URLQueryItem(name: "action", value: action)) }
-        comps.queryItems = q + extra
+        if let action = action { items.append(URLQueryItem(name: "action", value: action)) }
+        comps.queryItems = items + extra
         return comps.url
     }
 
-    private func fetch(_ url: URL, timeout: TimeInterval = 45) async throws -> Data {
-        var request = URLRequest(url: url, timeoutInterval: timeout)
+    private func fetch(_ url: URL) async throws -> Data {
+        var request = URLRequest(url: url, timeoutInterval: 25)
+        // Some providers block the default iOS user agent
         request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
         let (data, response) = try await URLSession.shared.data(for: request)
         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
@@ -145,14 +94,6 @@ class IPTVViewModel: ObservableObject {
             throw URLError(.badServerResponse)
         }
         return data
-    }
-
-    private func actions(for kind: ContentKind) -> (cats: String, items: String) {
-        switch kind {
-        case .live:   return ("get_live_categories", "get_live_streams")
-        case .movies: return ("get_vod_categories", "get_vod_streams")
-        case .series: return ("get_series_categories", "get_series")
-        }
     }
 
     func login() async {
@@ -166,6 +107,8 @@ class IPTVViewModel: ObservableObject {
         }
         do {
             let data = try await fetch(url)
+            print("LOGIN RESPONSE: \(String(data: data, encoding: .utf8) ?? "")")
+
             let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
             let info = json?["user_info"] as? [String: Any]
             let auth = "\(info?["auth"] ?? 0)"
@@ -174,125 +117,63 @@ class IPTVViewModel: ObservableObject {
                 UserDefaults.standard.set(host, forKey: "iptv_host")
                 UserDefaults.standard.set(username, forKey: "iptv_user")
                 UserDefaults.standard.set(password, forKey: "iptv_pass")
-                await loadCategories(.live)
+                await loadCategories()
                 if errorMessage == nil { isLoggedIn = true }
             } else {
                 errorMessage = "Login failed. Check the URL, username and password."
             }
         } catch {
             errorMessage = "Could not connect: \(error.localizedDescription)"
+            print("❌ Login error: \(error)")
         }
     }
 
-    func loadCategories(_ kind: ContentKind) async {
-        guard let url = makeURL(action: actions(for: kind).cats) else { return }
-        errorMessage = nil
+    func loadCategories() async {
+        guard let url = makeURL(action: "get_live_categories") else { return }
         do {
             let data = try await fetch(url)
-            categories[kind] = try JSONDecoder().decode([IPTVCategory].self, from: data)
+            categories = try JSONDecoder().decode([LiveCategory].self, from: data)
+            print("✅ Loaded \(categories.count) categories")
         } catch {
             errorMessage = "Categories failed: \(error.localizedDescription)"
+            print("❌ Categories error: \(error)")
         }
     }
 
-    func loadItems(_ kind: ContentKind, category: IPTVCategory) async {
+    func loadChannels(for category: LiveCategory) async {
         isLoading = true
         errorMessage = nil
-        items = []
+        channels = []
         defer { isLoading = false }
 
         let extra = [URLQueryItem(name: "category_id", value: category.categoryId)]
-        guard let url = makeURL(action: actions(for: kind).items, extra: extra) else { return }
+        guard let url = makeURL(action: "get_live_streams", extra: extra) else { return }
         do {
             let data = try await fetch(url)
-            let decoded = try JSONDecoder().decode([MediaItem].self, from: data)
-            items = decoded.filter { $0.id != 0 } // Filter out invalid items
+            channels = try JSONDecoder().decode([LiveChannel].self, from: data)
+            print("✅ Loaded \(channels.count) channels")
         } catch {
-            errorMessage = "Loading failed: \(error.localizedDescription)"
+            errorMessage = "Channels failed: \(error.localizedDescription)"
+            print("❌ Channels error: \(error)")
         }
     }
 
-    // Background decoding to prevent UI freezes on large VOD libraries
-    func loadLibrary(_ kind: ContentKind) async {
-        guard library[kind] == nil, !libraryLoading.contains(kind),
-              let url = makeURL(action: actions(for: kind).items) else { return }
-        libraryLoading.insert(kind)
-        libraryError = nil
-        defer { libraryLoading.remove(kind) }
-        do {
-            let data = try await fetch(url, timeout: 90)
-            let decoded = try await Task.detached(priority: .userInitiated) {
-                let items = try JSONDecoder().decode([MediaItem].self, from: data)
-                return items.filter { $0.id != 0 }
-            }.value
-            library[kind] = decoded
-        } catch {
-            libraryError = "Could not load search list: \(error.localizedDescription)"
-        }
-    }
-
-    func loadEpisodes(for series: MediaItem) async -> [Episode] {
-        let extra = [URLQueryItem(name: "series_id", value: String(series.id))]
-        guard let url = makeURL(action: "get_series_info", extra: extra) else { return [] }
-        do {
-            let data = try await fetch(url)
-            guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [] }
-            var result: [Episode] = []
-
-            func add(_ raw: Any, seasonHint: Int) {
-                guard let d = raw as? [String: Any] else { return }
-                let id: String
-                if let s = d["id"] as? String { id = s }
-                else if let i = d["id"] as? Int { id = String(i) }
-                else { return }
-                let number = intFrom(d["episode_num"], default: 0)
-                let season = intFrom(d["season"], default: seasonHint)
-                let title = (d["title"] as? String) ?? "Episode \(number)"
-                let ext = (d["container_extension"] as? String) ?? "mp4"
-                result.append(Episode(id: id, season: season, number: number, title: title, ext: ext))
-            }
-
-            if let dict = root["episodes"] as? [String: Any] {
-                for (seasonKey, value) in dict {
-                    for e in (value as? [Any]) ?? [] { add(e, seasonHint: Int(seasonKey) ?? 0) }
-                }
-            } else if let arr = root["episodes"] as? [Any] {
-                for (i, value) in arr.enumerated() {
-                    if let inner = value as? [Any] {
-                        for e in inner { add(e, seasonHint: i + 1) }
-                    } else {
-                        add(value, seasonHint: 0)
-                    }
-                }
-            }
-            return result.sorted { ($0.season, $0.number) < ($1.season, $1.number) }
-        } catch {
-            errorMessage = "Episodes failed: \(error.localizedDescription)"
-            return []
-        }
-    }
-
-    func liveURL(_ item: MediaItem) -> URL? {
-        URL(string: "\(baseURL)/live/\(u)/\(p)/\(item.id).ts")
-    }
-
-    func movieURL(_ item: MediaItem) -> URL? {
-        URL(string: "\(baseURL)/movie/\(u)/\(p)/\(item.id).\(item.ext)")
-    }
-
-    func episodeURL(_ ep: Episode) -> URL? {
-        URL(string: "\(baseURL)/series/\(u)/\(p)/\(ep.id).\(ep.ext)")
+    // Raw .ts feed: VLC plays this directly, and it avoids the extra delay of the .m3u8 version.
+    // If a channel shows a black screen, try changing ".ts" to ".m3u8".
+    func streamURL(for channel: LiveChannel) -> URL? {
+        let u = username.trimmingCharacters(in: .whitespaces)
+        let p = password.trimmingCharacters(in: .whitespaces)
+        return URL(string: "\(baseURL)/live/\(u)/\(p)/\(channel.id).ts")
     }
 
     func logout() {
         isLoggedIn = false
-        categories = [:]
-        items = []
-        library = [:]
+        categories = []
+        channels = []
     }
 }
 
-// MARK: - Root View
+// MARK: - Root View (kept as LiveCategoriesView so LeanIPTVApp.swift still works)
 
 struct LiveCategoriesView: View {
     @StateObject private var model = IPTVViewModel()
@@ -302,7 +183,7 @@ struct LiveCategoriesView: View {
             ZStack {
                 Color.black.ignoresSafeArea()
                 if model.isLoggedIn {
-                    HomeView(model: model)
+                    CategoryListView(model: model)
                 } else {
                     LoginView(model: model)
                 }
@@ -337,7 +218,9 @@ struct LoginView: View {
             }
 
             if let error = model.errorMessage {
-                Text(error).font(.caption).foregroundColor(.red)
+                Text(error)
+                    .font(.caption)
+                    .foregroundColor(.red)
             }
 
             Button(action: { Task { await model.login() } }) {
@@ -372,98 +255,24 @@ struct LoginView: View {
     }
 }
 
-// MARK: - Home
+// MARK: - Categories
 
-struct HomeView: View {
+struct CategoryListView: View {
     @ObservedObject var model: IPTVViewModel
-    @State private var kind: ContentKind = .live
-    @State private var query = ""
-    @AppStorage("data_saver") private var dataSaver = true
-
-    private var cats: [IPTVCategory] { model.categories[kind] ?? [] }
-    private var cleanQuery: String { query.trimmingCharacters(in: .whitespaces) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            header
-
-            Picker("Section", selection: $kind) {
-                ForEach(ContentKind.allCases) { k in
-                    Text(k.rawValue).tag(k)
-                }
+            HStack {
+                Text("Lean IPTV")
+                    .font(.largeTitle).fontWeight(.bold)
+                    .foregroundColor(.white)
+                Spacer()
+                Button("Log out") { model.logout() }
+                    .foregroundColor(.red)
             }
-            .pickerStyle(SegmentedPickerStyle())
             .padding(.horizontal)
 
-            searchField
-
-            if kind != .live {
-                Toggle(isOn: $dataSaver) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Data saver").foregroundColor(.white)
-                        Text("Hides 4K/UHD, no poster images, small buffer")
-                            .font(.caption).foregroundColor(.gray)
-                    }
-                }
-                .toggleStyle(SwitchToggleStyle(tint: .red))
-                .padding(.horizontal)
-            }
-
-            if cleanQuery.isEmpty {
-                categoryList
-            } else {
-                SearchResultsView(model: model, kind: kind, query: cleanQuery)
-            }
-        }
-        .task(id: kind) {
-            if model.categories[kind] == nil {
-                await model.loadCategories(kind)
-            }
-        }
-        .onChange(of: kind) { _ in
-            query = ""
-        }
-        .onChange(of: query) { newValue in
-            if !newValue.trimmingCharacters(in: .whitespaces).isEmpty {
-                Task { await model.loadLibrary(kind) }
-            }
-        }
-    }
-
-    private var header: some View {
-        HStack {
-            Text("Lean IPTV")
-                .font(.largeTitle).fontWeight(.bold)
-                .foregroundColor(.white)
-            Spacer()
-            Button("Log out") { model.logout() }
-                .foregroundColor(.red)
-        }
-        .padding(.horizontal)
-    }
-
-    private var searchField: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "magnifyingglass").foregroundColor(.gray)
-            TextField("Search all \(kind.rawValue.lowercased())", text: $query)
-                .autocapitalization(.none)
-                .disableAutocorrection(true)
-                .foregroundColor(.white)
-            if !query.isEmpty {
-                Button(action: { query = "" }) {
-                    Image(systemName: "xmark.circle.fill").foregroundColor(.gray)
-                }
-            }
-        }
-        .padding(10)
-        .background(Color.gray.opacity(0.2))
-        .cornerRadius(10)
-        .padding(.horizontal)
-    }
-
-    private var categoryList: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("\(kind.rawValue.uppercased()) CATEGORIES (\(cats.count))")
+            Text("LIVE CATEGORIES (\(model.categories.count))")
                 .font(.subheadline)
                 .foregroundColor(.gray)
                 .padding(.horizontal)
@@ -474,8 +283,8 @@ struct HomeView: View {
 
             ScrollView {
                 LazyVStack(spacing: 12) {
-                    ForEach(cats) { category in
-                        NavigationLink(destination: ItemListView(model: model, kind: kind, category: category)) {
+                    ForEach(model.categories) { category in
+                        NavigationLink(destination: ChannelListView(model: model, category: category)) {
                             HStack {
                                 Text(category.categoryName)
                                     .foregroundColor(.white)
@@ -496,155 +305,22 @@ struct HomeView: View {
     }
 }
 
-// MARK: - Search results
+// MARK: - Channels
 
-struct SearchResultsView: View {
+struct ChannelListView: View {
     @ObservedObject var model: IPTVViewModel
-    let kind: ContentKind
-    let query: String
-
-    @AppStorage("data_saver") private var dataSaver = true
-    private let maxResults = 300
-
-    private var matches: [MediaItem] {
-        guard let all = model.library[kind] else { return [] }
-        let words = query.lowercased().split(separator: " ").map { String($0) }
-        guard !words.isEmpty else { return [] }
-        return all.filter { item in
-            if kind != .live && dataSaver {
-                let n = item.searchKey
-                if n.contains("4k") || n.contains("uhd") || n.contains("2160") { return false }
-            }
-            return words.allSatisfy { item.searchKey.contains($0) }
-        }
-    }
-
-    var body: some View {
-        let found = matches
-        let shown = Array(found.prefix(maxResults))
-
-        VStack(alignment: .leading, spacing: 10) {
-            if model.libraryLoading.contains(kind) {
-                HStack(spacing: 8) {
-                    ProgressView()
-                    Text("Loading full library catalog...")
-                        .font(.caption).foregroundColor(.gray)
-                }
-                .padding(.horizontal)
-            } else if let error = model.libraryError, model.library[kind] == nil {
-                Text(error).font(.caption).foregroundColor(.red).padding(.horizontal)
-            } else {
-                Text(found.count > maxResults
-                     ? "\(found.count) RESULTS · showing first \(maxResults)"
-                     : "\(found.count) RESULTS")
-                    .font(.caption)
-                    .foregroundColor(.gray)
-                    .padding(.horizontal)
-            }
-
-            ScrollView {
-                LazyVStack(spacing: 10) {
-                    ForEach(shown) { item in
-                        NavigationLink(destination: ItemDestination(model: model, kind: kind, item: item)) {
-                            MediaRow(name: item.name,
-                                     icon: item.icon,
-                                     symbol: symbolName(for: kind),
-                                     showIcon: kind == .live || !dataSaver)
-                        }
-                    }
-                }
-                .padding(.horizontal)
-            }
-        }
-    }
-}
-
-// MARK: - Shared pieces
-
-struct ItemDestination: View {
-    @ObservedObject var model: IPTVViewModel
-    let kind: ContentKind
-    let item: MediaItem
-
-    var body: some View {
-        switch kind {
-        case .live:
-            PlayerView(title: item.name, url: model.liveURL(item), mode: .live)
-        case .movies:
-            PlayerView(title: item.name, url: model.movieURL(item), mode: .vod)
-        case .series:
-            EpisodeListView(model: model, series: item)
-        }
-    }
-}
-
-struct MediaRow: View {
-    let name: String
-    let icon: String?
-    let symbol: String
-    let showIcon: Bool
-
-    var body: some View {
-        HStack(spacing: 12) {
-            if showIcon, let icon = icon, let iconURL = URL(string: icon) {
-                AsyncImage(url: iconURL) { image in
-                    image.resizable().scaledToFit()
-                } placeholder: {
-                    Color.gray.opacity(0.2)
-                }
-                .frame(width: 40, height: 40)
-            }
-            Text(name)
-                .foregroundColor(.white)
-                .multilineTextAlignment(.leading)
-            Spacer()
-            Image(systemName: symbol).foregroundColor(.gray)
-        }
-        .padding()
-        .background(Color.gray.opacity(0.15))
-        .cornerRadius(10)
-    }
-}
-
-// MARK: - Item list
-
-struct ItemListView: View {
-    @ObservedObject var model: IPTVViewModel
-    let kind: ContentKind
-    let category: IPTVCategory
-
-    @AppStorage("data_saver") private var dataSaver = true
-    @State private var query = ""
-
-    private var shown: [MediaItem] {
-        model.items.filter { item in
-            let n = item.name.uppercased()
-            if kind != .live && dataSaver && (n.contains("4K") || n.contains("UHD") || n.contains("2160")) {
-                return false
-            }
-            return query.isEmpty || n.contains(query.uppercased())
-        }
-    }
+    let category: LiveCategory
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
-                    Text("\(shown.count) ITEMS")
+                    Text("CHANNELS (\(model.channels.count))")
                         .font(.subheadline).foregroundColor(.gray)
                     if model.isLoading { ProgressView().scaleEffect(0.8) }
                 }
                 .padding(.horizontal)
-
-                TextField("Search this category", text: $query)
-                    .autocapitalization(.none)
-                    .disableAutocorrection(true)
-                    .padding(10)
-                    .background(Color.gray.opacity(0.2))
-                    .cornerRadius(10)
-                    .foregroundColor(.white)
-                    .padding(.horizontal)
 
                 if let error = model.errorMessage {
                     Text(error).font(.caption).foregroundColor(.red).padding(.horizontal)
@@ -652,12 +328,28 @@ struct ItemListView: View {
 
                 ScrollView {
                     LazyVStack(spacing: 10) {
-                        ForEach(shown) { item in
-                            NavigationLink(destination: ItemDestination(model: model, kind: kind, item: item)) {
-                                MediaRow(name: item.name,
-                                         icon: item.icon,
-                                         symbol: symbolName(for: kind),
-                                         showIcon: kind == .live || !dataSaver)
+                        ForEach(model.channels) { channel in
+                            NavigationLink(destination: PlayerView(channel: channel, url: model.streamURL(for: channel))) {
+                                HStack(spacing: 12) {
+                                    if let icon = channel.icon, let iconURL = URL(string: icon) {
+                                        if #available(iOS 15.0, *) {
+                                            AsyncImage(url: iconURL) { image in
+                                                image.resizable().scaledToFit()
+                                            } placeholder: {
+                                                Color.gray.opacity(0.2)
+                                            }
+                                            .frame(width: 40, height: 40)
+                                        }
+                                    }
+                                    Text(channel.name)
+                                        .foregroundColor(.white)
+                                        .multilineTextAlignment(.leading)
+                                    Spacer()
+                                    Image(systemName: "play.fill").foregroundColor(.gray)
+                                }
+                                .padding()
+                                .background(Color.gray.opacity(0.15))
+                                .cornerRadius(10)
                             }
                         }
                     }
@@ -667,91 +359,46 @@ struct ItemListView: View {
         }
         .navigationBarTitle(category.categoryName, displayMode: .inline)
         .navigationBarHidden(false)
-        .task { await model.loadItems(kind, category: category) }
+        .task { await model.loadChannels(for: category) }
     }
 }
 
-// MARK: - Episodes
+// MARK: - VLC Player (low-latency)
 
-struct EpisodeListView: View {
-    @ObservedObject var model: IPTVViewModel
-    let series: MediaItem
-
-    @State private var episodes: [Episode] = []
-    @State private var loading = true
-
-    var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-            VStack(alignment: .leading, spacing: 12) {
-                HStack {
-                    Text("EPISODES (\(episodes.count))")
-                        .font(.subheadline).foregroundColor(.gray)
-                    if loading { ProgressView().scaleEffect(0.8) }
-                }
-                .padding(.horizontal)
-
-                if !loading && episodes.isEmpty {
-                    Text("No episodes found").font(.caption).foregroundColor(.gray).padding(.horizontal)
-                }
-                if let error = model.errorMessage {
-                    Text(error).font(.caption).foregroundColor(.red).padding(.horizontal)
-                }
-
-                ScrollView {
-                    LazyVStack(spacing: 10) {
-                        ForEach(episodes) { ep in
-                            NavigationLink(destination: PlayerView(title: ep.title,
-                                                                   url: model.episodeURL(ep),
-                                                                   mode: .vod)) {
-                                MediaRow(name: "S\(ep.season) E\(ep.number) · \(ep.title)",
-                                         icon: nil,
-                                         symbol: "play.fill",
-                                         showIcon: false)
-                            }
-                        }
-                    }
-                    .padding(.horizontal)
-                }
-            }
-        }
-        .navigationBarTitle(series.name, displayMode: .inline)
-        .navigationBarHidden(false)
-        .task {
-            loading = true
-            episodes = await model.loadEpisodes(for: series)
-            loading = false
-        }
-    }
-}
-
-// MARK: - VLC player
+// Smaller number = closer to live but more risk of stuttering. 300–1500 is a sensible range.
+private let vlcCachingMs = 500
 
 final class VLCController: ObservableObject {
     let player = VLCMediaPlayer()
+    private var started = false
 
-    func start(url: URL, options: [String]) {
-        player.stop()
+    func play(url: URL) {
+        guard !started else { return }
+        started = true
         let media = VLCMedia(url: url)
-        for o in options { media.addOption(o) }
+        media.addOption(":network-caching=\(vlcCachingMs)")
+        media.addOption(":live-caching=\(vlcCachingMs)")
+        media.addOption(":clock-jitter=0")
+        media.addOption(":clock-synchro=0")
         player.media = media
         player.play()
     }
 
     func stop() {
         player.stop()
+        started = false
     }
 }
 
 struct VLCSurface: UIViewRepresentable {
     let controller: VLCController
-    let onReady: () -> Void
+    let url: URL
 
     func makeUIView(context: Context) -> UIView {
         let view = UIView()
         view.backgroundColor = .black
         controller.player.drawable = view
-        DispatchQueue.main.async { onReady() }
+        controller.play(url: url)
         return view
     }
 
@@ -759,34 +406,19 @@ struct VLCSurface: UIViewRepresentable {
 }
 
 struct PlayerView: View {
-    let title: String
+    let channel: LiveChannel
     let url: URL?
-    let mode: PlaybackMode
-
-    @AppStorage("live_caching") private var liveCaching = 1500
-    @AppStorage("data_saver") private var dataSaver = true
 
     @StateObject private var controller = VLCController()
     @State private var connecting = true
-    @State private var showControls = true
-    @State private var progress: Double = 0
-    @State private var scrubbing = false
-    @State private var playing = true
-    @State private var elapsed = "0:00"
-    @State private var total = "0:00"
-
-    private let steps = [300, 500, 800, 1200, 1500, 2000, 3000, 5000]
     private let poll = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-
-            if url != nil {
-                VLCSurface(controller: controller, onReady: { startPlayback() })
+            if let url = url {
+                VLCSurface(controller: controller, url: url)
                     .ignoresSafeArea(edges: .bottom)
-                    .contentShape(Rectangle())
-                    .onTapGesture { withAnimation { showControls.toggle() } }
             } else {
                 Text("Could not build stream URL").foregroundColor(.red)
             }
@@ -799,144 +431,23 @@ struct PlayerView: View {
                         .foregroundColor(.gray)
                 }
             }
-
-            if showControls && url != nil {
-                VStack {
-                    Spacer()
-                    controlsPanel
-                }
-            }
         }
-        .navigationBarTitle(title, displayMode: .inline)
+        .navigationBarTitle(channel.name, displayMode: .inline)
         .navigationBarHidden(false)
         .onAppear {
+            // Play audio even with the silent switch on
             do {
                 try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
                 try AVAudioSession.sharedInstance().setActive(true)
             } catch {
                 print("Audio session error: \(error)")
             }
-            UIApplication.shared.isIdleTimerDisabled = true
         }
         .onDisappear {
             controller.stop()
-            UIApplication.shared.isIdleTimerDisabled = false
         }
-        .onReceive(poll) { _ in tick() }
-    }
-
-    private func startPlayback() {
-        guard let url = url else { return }
-        connecting = true
-        var opts: [String]
-        switch mode {
-        case .live:
-            opts = [":network-caching=\(liveCaching)",
-                    ":live-caching=\(liveCaching)",
-                    ":clock-jitter=0",
-                    ":clock-synchro=0"]
-        case .vod:
-            let cache = dataSaver ? 1500 : 4000
-            opts = [":network-caching=\(cache)"]
-            if dataSaver {
-                opts += [":adaptive-maxheight=720", ":adaptive-maxwidth=1280"]
-            }
+        .onReceive(poll) { _ in
+            if controller.player.isPlaying { connecting = false }
         }
-        controller.start(url: url, options: opts)
-    }
-
-    private func changeBuffer(by direction: Int) {
-        let idx = steps.firstIndex(where: { $0 >= liveCaching }) ?? (steps.count - 1)
-        let newIdx = min(max(idx + direction, 0), steps.count - 1)
-        liveCaching = steps[newIdx]
-        startPlayback()
-    }
-
-    private func tick() {
-        let p = controller.player
-        playing = p.isPlaying
-        if p.isPlaying { connecting = false }
-        if mode == .vod && !scrubbing {
-            progress = Double(p.position)
-            elapsed = clock(Int(p.time.intValue))
-            total = clock(Int(p.media?.length.intValue ?? 0))
-        }
-    }
-
-    @ViewBuilder
-    private var controlsPanel: some View {
-        switch mode {
-        case .live: liveControls
-        case .vod: vodControls
-        }
-    }
-
-    private var liveControls: some View {
-        VStack(spacing: 8) {
-            Text("Live buffer: " + String(format: "%.1f", Double(liveCaching) / 1000) + " s")
-                .font(.footnote.weight(.semibold))
-                .foregroundColor(.white)
-            HStack(spacing: 12) {
-                Button(action: { changeBuffer(by: -1) }) {
-                    Label("Lower delay", systemImage: "minus.circle")
-                }
-                Button(action: { changeBuffer(by: 1) }) {
-                    Label("More stable", systemImage: "plus.circle")
-                }
-            }
-            .font(.footnote.weight(.semibold))
-            .foregroundColor(.white)
-        }
-        .padding(12)
-        .frame(maxWidth: .infinity)
-        .background(Color.black.opacity(0.65))
-    }
-
-    private var vodControls: some View {
-        VStack(spacing: 6) {
-            Slider(value: $progress, in: 0...1, onEditingChanged: { editing in
-                scrubbing = editing
-                if !editing { controller.player.position = Float(progress) }
-            })
-            HStack {
-                Text(elapsed).font(.caption2).foregroundColor(.white)
-                Spacer()
-                Text(total).font(.caption2).foregroundColor(.white)
-            }
-            HStack(spacing: 30) {
-                Button(action: { seek(by: -30) }) {
-                    Image(systemName: "gobackward.30").font(.title2)
-                }
-                Button(action: {
-                    if controller.player.isPlaying { controller.player.pause() }
-                    else { controller.player.play() }
-                }) {
-                    Image(systemName: playing ? "pause.fill" : "play.fill").font(.title)
-                }
-                Button(action: { seek(by: 30) }) {
-                    Image(systemName: "goforward.30").font(.title2)
-                }
-            }
-            .foregroundColor(.white)
-        }
-        .padding(12)
-        .background(Color.black.opacity(0.65))
-    }
-
-    private func seek(by seconds: Double) {
-        let p = controller.player
-        let lengthMs = Double(p.media?.length.intValue ?? 0)
-        guard lengthMs > 0 else { return }
-        let newPos = Double(p.position) + (seconds * 1000) / lengthMs
-        p.position = Float(min(max(newPos, 0), 0.999))
-    }
-
-    private func clock(_ ms: Int) -> String {
-        let s = max(ms, 0) / 1000
-        let h = s / 3600
-        let m = (s % 3600) / 60
-        let sec = s % 60
-        if h > 0 { return String(format: "%d:%02d:%02d", h, m, sec) }
-        return String(format: "%d:%02d", m, sec)
     }
 }
