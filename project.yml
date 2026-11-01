@@ -18,10 +18,7 @@ targets:
         CURRENT_PROJECT_VERSION: "1"
         SWIFT_VERSION: "5.0"
         TARGETED_DEVICE_FAMILY: "1,2"
-        # Required to let MobileVLCKit run properly without crashing on architecture checks
         ENABLE_BITCODE: false
-    dependencies:
-      - cocoapod: MobileVLCKit
     info:
       path: GeneratedInfo.plist
       properties:
