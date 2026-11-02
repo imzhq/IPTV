@@ -32,4 +32,4 @@ targets:
         UIBackgroundModes:
           - audio
         NSAppTransportSecurity:
-          NSAllowsArbitraryLoads: true
+          NSAllowsArbitraryLoads: true 
