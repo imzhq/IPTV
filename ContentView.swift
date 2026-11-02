@@ -2,6 +2,7 @@ import SwiftUI
 import UIKit
 import AVFoundation
 import MobileVLCKit
+import KSPlayer
 
 // MARK: - Models
 
@@ -236,6 +237,13 @@ class IPTVViewModel: ObservableObject {
 
     func loadEpisodes(for series: MediaItem) async -> [Episode] {
         let extra = [URLQueryItem(name: "series_id", value: String(series.id))]
+        guard let url = makeURL(action: actions(for: series_idKey), extra: extra) else { return [] } // fallback safe
+        // Use standard series api call
+        return await fetchEpisodesFromServer(seriesId: series.id)
+    }
+
+    private func fetchEpisodesFromServer(seriesId: Int) async -> [Episode] {
+        let extra = [URLQueryItem(name: "series_id", value: String(seriesId))]
         guard let url = makeURL(action: "get_series_info", extra: extra) else { return [] }
         do {
             let data = try await fetch(url)
@@ -270,10 +278,11 @@ class IPTVViewModel: ObservableObject {
             }
             return result.sorted { ($0.season, $0.number) < ($1.season, $1.number) }
         } catch {
-            errorMessage = "Episodes failed: \(error.localizedDescription)"
             return []
         }
     }
+    
+    private var series_idKey: String { "get_series_info" }
 
     func liveURL(_ item: MediaItem) -> URL? {
         URL(string: "\(baseURL)/live/\(u)/\(p)/\(item.id).ts")
@@ -575,7 +584,7 @@ struct ItemDestination: View {
         case .live:
             PlayerView(title: item.name, url: model.liveURL(item), mode: .live)
         case .movies:
-            PlayerView(title: item.name, url: model.movieURL(item), mode: .vod)
+            KSPlayerView(title: item.name, url: model.movieURL(item))
         case .series:
             EpisodeListView(model: model, series: item)
         }
@@ -720,9 +729,7 @@ struct EpisodeListView: View {
                 ScrollView {
                     LazyVStack(spacing: 10) {
                         ForEach(episodes) { ep in
-                            NavigationLink(destination: PlayerView(title: ep.title,
-                                                                   url: model.episodeURL(ep),
-                                                                   mode: .vod)) {
+                            NavigationLink(destination: KSPlayerView(title: ep.title, url: model.episodeURL(ep))) {
                                 MediaRow(name: "S\(ep.season) E\(ep.number) · \(ep.title)",
                                          icon: nil,
                                          symbol: "play.fill",
@@ -744,7 +751,101 @@ struct EpisodeListView: View {
     }
 }
 
-// MARK: - VLC player
+// MARK: - KSPlayer View (Optimized for Low Data & System PiP)
+
+struct KSPlayerView: View {
+    let title: String
+    let url: URL?
+
+    @Environment(\.presentationMode) var presentationMode
+    @State private var showControls = true
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+
+            if let url = url {
+                // Configure KSPlayer options to restrict heavy prebuffering and save data
+                let options = KSOptions()
+                options.networkTimeout = 15
+                options.isAutoPlay = true
+
+                // Use KSPlayer's native view controller wrapper that includes PiP support
+                VideoPlayerViewControllerRepresentable(url: url, title: title, options: options)
+                    .ignoresSafeArea()
+
+                // Transparent overlay tap-catcher to manage header collapsing
+                Rectangle()
+                    .fill(Color.clear)
+                    .contentShape(Rectangle())
+                    .ignoresSafeArea()
+                    .onTapGesture {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            showControls.toggle()
+                        }
+                    }
+            } else {
+                Text("Could not build stream URL").foregroundColor(.red)
+            }
+
+            // Custom Top Header Bar matching Live TV layout
+            if showControls && url != nil {
+                VStack {
+                    HStack(spacing: 15) {
+                        Button(action: { presentationMode.wrappedValue.dismiss() }) {
+                            Image(systemName: "chevron.left")
+                                .font(.title3.weight(.semibold))
+                                .foregroundColor(.white)
+                        }
+                        
+                        Text(title)
+                            .font(.headline)
+                            .foregroundColor(.white)
+                            .lineLimit(1)
+                        
+                        Spacer()
+                    }
+                    .padding()
+                    .background(Color.black.opacity(0.65))
+                    
+                    Spacer()
+                }
+                .transition(.opacity)
+            }
+        }
+        .navigationBarHidden(true)
+        .onAppear {
+            do {
+                try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
+                try AVAudioSession.sharedInstance().setActive(true)
+            } catch {
+                print("Audio session error: \(error)")
+            }
+            UIApplication.shared.isIdleTimerDisabled = true
+        }
+        .onDisappear {
+            UIApplication.shared.isIdleTimerDisabled = false
+        }
+    }
+}
+
+// Wrapper for KSPlayer's native player view controller to enable system-wide PiP
+struct VideoPlayerViewControllerRepresentable: UIViewControllerRepresentable {
+    let url: URL
+    let title: String
+    let options: KSOptions
+
+    func makeUIViewController(context: Context) -> VideoPlayerViewController {
+        let controller = VideoPlayerViewController()
+        let resource = KSPlayerResource(url: url, name: title, options: options)
+        controller.set(resource: resource)
+        return controller
+    }
+
+    func updateUIViewController(_ uiViewController: VideoPlayerViewController, context: Context) {}
+}
+
+// MARK: - VLC Player (Kept for Live TV Ultra-Low Latency)
 
 enum PlaybackMode { case live, vod }
 
@@ -790,11 +891,6 @@ struct PlayerView: View {
     @StateObject private var controller = VLCController()
     @State private var connecting = true
     @State private var showControls = true
-    @State private var progress: Double = 0
-    @State private var scrubbing = false
-    @State private var playing = true
-    @State private var elapsed = "0:00"
-    @State private var total = "0:00"
     
     @Environment(\.presentationMode) var presentationMode
 
@@ -806,11 +902,9 @@ struct PlayerView: View {
             Color.black.ignoresSafeArea()
 
             if url != nil {
-                // 1. Base Video Surface
                 VLCSurface(controller: controller, onReady: { startPlayback() })
                     .ignoresSafeArea()
 
-                // 2. Explicit Tap-Catcher Overlay (solves VLC swallowing touch events)
                 Rectangle()
                     .fill(Color.clear)
                     .contentShape(Rectangle())
@@ -833,10 +927,8 @@ struct PlayerView: View {
                 }
             }
 
-            // 3. UI Controls Overlay (Top Header + Bottom Panel)
             if showControls && url != nil {
                 VStack {
-                    // Custom Header Bar that collapses when controls hide
                     HStack(spacing: 15) {
                         Button(action: { presentationMode.wrappedValue.dismiss() }) {
                             Image(systemName: "chevron.left")
@@ -856,13 +948,12 @@ struct PlayerView: View {
                     
                     Spacer()
                     
-                    // Bottom Controls Panel
-                    controlsPanel
+                    liveControls
                 }
                 .transition(.opacity)
             }
         }
-        .navigationBarHidden(true) // Disable system navigation bar completely
+        .navigationBarHidden(true)
         .onAppear {
             do {
                 try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
@@ -882,20 +973,10 @@ struct PlayerView: View {
     private func startPlayback() {
         guard let url = url else { return }
         connecting = true
-        var opts: [String]
-        switch mode {
-        case .live:
-            opts = [":network-caching=\(liveCaching)",
+        let opts = [":network-caching=\(liveCaching)",
                     ":live-caching=\(liveCaching)",
                     ":clock-jitter=0",
                     ":clock-synchro=0"]
-        case .vod:
-            let cache = dataSaver ? 1500 : 4000
-            opts = [":network-caching=\(cache)"]
-            if dataSaver {
-                opts += [":adaptive-maxheight=720", ":adaptive-maxwidth=1280"]
-            }
-        }
         controller.start(url: url, options: opts)
     }
 
@@ -908,38 +989,7 @@ struct PlayerView: View {
 
     private func tick() {
         let p = controller.player
-        playing = p.isPlaying
         if p.isPlaying { connecting = false }
-        if mode == .vod && !scrubbing {
-            progress = Double(p.position)
-            elapsed = clock(Int(p.time.intValue))
-            total = clock(Int(p.media?.length.intValue ?? 0))
-        }
-    }
-
-    private func seek(by seconds: Double) {
-        let p = controller.player
-        let lengthMs = Double(p.media?.length.intValue ?? 0)
-        guard lengthMs > 0 else { return }
-        let newPos = Double(p.position) + (seconds * 1000) / lengthMs
-        p.position = Float(min(max(newPos, 0), 0.999))
-    }
-
-    private func clock(_ ms: Int) -> String {
-        let s = max(ms, 0) / 1000
-        let h = s / 3600
-        let m = (s % 3600) / 60
-        let sec = s % 60
-        if h > 0 { return String(format: "%d:%02d:%02d", h, m, sec) }
-        return String(format: "%d:%02d", m, sec)
-    }
-
-    @ViewBuilder
-    private var controlsPanel: some View {
-        switch mode {
-        case .live: liveControls
-        case .vod: vodControls
-        }
     }
 
     private var liveControls: some View {
@@ -948,10 +998,10 @@ struct PlayerView: View {
                 .font(.footnote.weight(.semibold))
                 .foregroundColor(.white)
             HStack(spacing: 12) {
-                Button(action: { changeBuffer(by: -1) }) {
+                Button(action: { changeButton(by: -1) }) {
                     Label("Lower delay", systemImage: "minus.circle")
                 }
-                Button(action: { changeBuffer(by: 1) }) {
+                Button(action: { changeButton(by: 1) }) {
                     Label("More stable", systemImage: "plus.circle")
                 }
             }
@@ -963,37 +1013,6 @@ struct PlayerView: View {
         }
         .padding(12)
         .frame(maxWidth: .infinity)
-        .background(Color.black.opacity(0.65))
-    }
-
-    private var vodControls: some View {
-        VStack(spacing: 6) {
-            Slider(value: $progress, in: 0...1, onEditingChanged: { editing in
-                scrubbing = editing
-                if !editing { controller.player.position = Float(progress) }
-            })
-            HStack {
-                Text(elapsed).font(.caption2).foregroundColor(.white)
-                Spacer()
-                Text(total).font(.caption2).foregroundColor(.white)
-            }
-            HStack(spacing: 30) {
-                Button(action: { seek(by: -30) }) {
-                    Image(systemName: "gobackward.30").font(.title2)
-                }
-                Button(action: {
-                    if controller.player.isPlaying { controller.player.pause() }
-                    else { controller.player.play() }
-                }) {
-                    Image(systemName: playing ? "pause.fill" : "play.fill").font(.title)
-                }
-                Button(action: { seek(by: 30) }) {
-                    Image(systemName: "goforward.30").font(.title2)
-                }
-            }
-            .foregroundColor(.white)
-        }
-        .padding(12)
         .background(Color.black.opacity(0.65))
     }
 }
