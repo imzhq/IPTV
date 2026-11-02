@@ -13,21 +13,6 @@ enum ContentKind: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-enum HomeTab: String, CaseIterable, Identifiable {
-    case live = "Live TV"
-    case movies = "Movies"
-    case series = "Series"
-    var id: String { rawValue }
-
-    var kind: ContentKind? {
-        switch self {
-        case .live: return .live
-        case .movies: return .movies
-        case .series: return .series
-        }
-    }
-}
-
 func symbolName(for kind: ContentKind) -> String {
     switch kind {
     case .live: return "play.fill"
@@ -237,13 +222,6 @@ class IPTVViewModel: ObservableObject {
 
     func loadEpisodes(for series: MediaItem) async -> [Episode] {
         let extra = [URLQueryItem(name: "series_id", value: String(series.id))]
-        guard let url = makeURL(action: actions(for: series_idKey), extra: extra) else { return [] } // fallback safe
-        // Use standard series api call
-        return await fetchEpisodesFromServer(seriesId: series.id)
-    }
-
-    private func fetchEpisodesFromServer(seriesId: Int) async -> [Episode] {
-        let extra = [URLQueryItem(name: "series_id", value: String(seriesId))]
         guard let url = makeURL(action: "get_series_info", extra: extra) else { return [] }
         do {
             let data = try await fetch(url)
@@ -278,12 +256,12 @@ class IPTVViewModel: ObservableObject {
             }
             return result.sorted { ($0.season, $0.number) < ($1.season, $1.number) }
         } catch {
+            errorMessage = "Episodes failed: \(error.localizedDescription)"
             return []
         }
     }
-    
-    private var series_idKey: String { "get_series_info" }
 
+    // Raw .ts feed for live (lowest delay). If a channel is black, try ".m3u8" instead of ".ts".
     func liveURL(_ item: MediaItem) -> URL? {
         URL(string: "\(baseURL)/live/\(u)/\(p)/\(item.id).ts")
     }
@@ -304,7 +282,7 @@ class IPTVViewModel: ObservableObject {
     }
 }
 
-// MARK: - Root View
+// MARK: - Root View (kept as LiveCategoriesView so LeanIPTVApp.swift still works)
 
 struct LiveCategoriesView: View {
     @StateObject private var model = IPTVViewModel()
@@ -390,11 +368,10 @@ struct LoginView: View {
 
 struct HomeView: View {
     @ObservedObject var model: IPTVViewModel
-    @State private var tab: HomeTab = .live
+    @State private var kind: ContentKind = .live
     @State private var query = ""
     @AppStorage("data_saver") private var dataSaver = true
 
-    private var kind: ContentKind { tab.kind ?? .live }
     private var cats: [IPTVCategory] { model.categories[kind] ?? [] }
     private var cleanQuery: String { query.trimmingCharacters(in: .whitespaces) }
 
@@ -402,9 +379,9 @@ struct HomeView: View {
         VStack(alignment: .leading, spacing: 12) {
             header
 
-            Picker("Section", selection: $tab) {
-                ForEach(HomeTab.allCases) { t in
-                    Text(t.rawValue).tag(t)
+            Picker("Section", selection: $kind) {
+                ForEach(ContentKind.allCases) { k in
+                    Text(k.rawValue).tag(k)
                 }
             }
             .pickerStyle(SegmentedPickerStyle())
@@ -430,12 +407,12 @@ struct HomeView: View {
                 SearchResultsView(model: model, kind: kind, query: cleanQuery)
             }
         }
-        .task(id: tab) {
-            if let k = tab.kind, model.categories[k] == nil {
-                await model.loadCategories(k)
+        .task(id: kind) {
+            if model.categories[kind] == nil {
+                await model.loadCategories(kind)
             }
         }
-        .onChange(of: tab) { _ in
+        .onChange(of: kind) { _ in
             query = ""
         }
         .onChange(of: query) { _ in
@@ -582,9 +559,9 @@ struct ItemDestination: View {
     var body: some View {
         switch kind {
         case .live:
-            PlayerView(title: item.name, url: model.liveURL(item), mode: .live)
+            LivePlayerView(title: item.name, url: model.liveURL(item))
         case .movies:
-            KSPlayerView(title: item.name, url: model.movieURL(item))
+            MoviePlayerView(title: item.name, url: model.movieURL(item))
         case .series:
             EpisodeListView(model: model, series: item)
         }
@@ -729,7 +706,7 @@ struct EpisodeListView: View {
                 ScrollView {
                     LazyVStack(spacing: 10) {
                         ForEach(episodes) { ep in
-                            NavigationLink(destination: KSPlayerView(title: ep.title, url: model.episodeURL(ep))) {
+                            NavigationLink(destination: MoviePlayerView(title: ep.title, url: model.episodeURL(ep))) {
                                 MediaRow(name: "S\(ep.season) E\(ep.number) · \(ep.title)",
                                          icon: nil,
                                          symbol: "play.fill",
@@ -751,69 +728,49 @@ struct EpisodeListView: View {
     }
 }
 
-// MARK: - KSPlayer View (Optimized for Low Data & System PiP)
+// MARK: - Movies and series player (KSPlayer, with picture in picture)
 
-struct KSPlayerView: View {
+// Wraps KSPlayer's ready-made player view, which has its own controls and a picture-in-picture button
+struct MovieSurface: UIViewRepresentable {
+    let url: URL
+    let dataSaver: Bool
+
+    func makeUIView(context: Context) -> IOSVideoPlayerView {
+        // If the built-in player can't open a format, KSPlayer falls back to its FFmpeg player
+        KSOptions.secondPlayerType = KSMEPlayer.self
+
+        let options = KSOptions()
+        options.isAutoPlay = true
+        // Smaller buffers download less video ahead of what you are watching
+        options.preferredForwardBufferDuration = dataSaver ? 2 : 4
+        options.maxBufferDuration = dataSaver ? 15 : 40
+
+        let view = IOSVideoPlayerView()
+        view.set(url: url, options: options)
+        return view
+    }
+
+    func updateUIView(_ uiView: IOSVideoPlayerView, context: Context) {}
+}
+
+struct MoviePlayerView: View {
     let title: String
     let url: URL?
 
-    @Environment(\.presentationMode) var presentationMode
-    @State private var showControls = true
+    @AppStorage("data_saver") private var dataSaver = true
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-
             if let url = url {
-                // Configure KSPlayer options to restrict heavy prebuffering and save data
-                let options = KSOptions()
-                options.networkTimeout = 15
-                options.isAutoPlay = true
-
-                // Use KSPlayer's native view controller wrapper that includes PiP support
-                VideoPlayerViewControllerRepresentable(url: url, title: title, options: options)
-                    .ignoresSafeArea()
-
-                // Transparent overlay tap-catcher to manage header collapsing
-                Rectangle()
-                    .fill(Color.clear)
-                    .contentShape(Rectangle())
-                    .ignoresSafeArea()
-                    .onTapGesture {
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            showControls.toggle()
-                        }
-                    }
+                MovieSurface(url: url, dataSaver: dataSaver)
+                    .ignoresSafeArea(edges: .bottom)
             } else {
                 Text("Could not build stream URL").foregroundColor(.red)
             }
-
-            // Custom Top Header Bar matching Live TV layout
-            if showControls && url != nil {
-                VStack {
-                    HStack(spacing: 15) {
-                        Button(action: { presentationMode.wrappedValue.dismiss() }) {
-                            Image(systemName: "chevron.left")
-                                .font(.title3.weight(.semibold))
-                                .foregroundColor(.white)
-                        }
-                        
-                        Text(title)
-                            .font(.headline)
-                            .foregroundColor(.white)
-                            .lineLimit(1)
-                        
-                        Spacer()
-                    }
-                    .padding()
-                    .background(Color.black.opacity(0.65))
-                    
-                    Spacer()
-                }
-                .transition(.opacity)
-            }
         }
-        .navigationBarHidden(true)
+        .navigationBarTitle(title, displayMode: .inline)
+        .navigationBarHidden(false)
         .onAppear {
             do {
                 try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
@@ -829,25 +786,7 @@ struct KSPlayerView: View {
     }
 }
 
-// Wrapper for KSPlayer's native player view controller to enable system-wide PiP
-struct VideoPlayerViewControllerRepresentable: UIViewControllerRepresentable {
-    let url: URL
-    let title: String
-    let options: KSOptions
-
-    func makeUIViewController(context: Context) -> VideoPlayerViewController {
-        let controller = VideoPlayerViewController()
-        let resource = KSPlayerResource(url: url, name: title, options: options)
-        controller.set(resource: resource)
-        return controller
-    }
-
-    func updateUIViewController(_ uiViewController: VideoPlayerViewController, context: Context) {}
-}
-
-// MARK: - VLC Player (Kept for Live TV Ultra-Low Latency)
-
-enum PlaybackMode { case live, vod }
+// MARK: - Live TV player (VLC, low delay)
 
 final class VLCController: ObservableObject {
     let player = VLCMediaPlayer()
@@ -880,18 +819,16 @@ struct VLCSurface: UIViewRepresentable {
     func updateUIView(_ uiView: UIView, context: Context) {}
 }
 
-struct PlayerView: View {
+struct LivePlayerView: View {
     let title: String
     let url: URL?
-    let mode: PlaybackMode
 
-    @AppStorage("live_caching") private var liveCaching = 1500
-    @AppStorage("data_saver") private var dataSaver = true
+    @AppStorage("live_caching") private var liveCaching = 1500   // ms of buffer for live TV
 
     @StateObject private var controller = VLCController()
     @State private var connecting = true
     @State private var showControls = true
-    
+
     @Environment(\.presentationMode) var presentationMode
 
     private let steps = [300, 500, 800, 1200, 1500, 2000, 3000, 5000]
@@ -935,19 +872,19 @@ struct PlayerView: View {
                                 .font(.title3.weight(.semibold))
                                 .foregroundColor(.white)
                         }
-                        
+
                         Text(title)
                             .font(.headline)
                             .foregroundColor(.white)
                             .lineLimit(1)
-                        
+
                         Spacer()
                     }
                     .padding()
                     .background(Color.black.opacity(0.65))
-                    
+
                     Spacer()
-                    
+
                     liveControls
                 }
                 .transition(.opacity)
@@ -967,7 +904,9 @@ struct PlayerView: View {
             controller.stop()
             UIApplication.shared.isIdleTimerDisabled = false
         }
-        .onReceive(poll) { _ in tick() }
+        .onReceive(poll) { _ in
+            if controller.player.isPlaying { connecting = false }
+        }
     }
 
     private func startPlayback() {
@@ -987,21 +926,16 @@ struct PlayerView: View {
         startPlayback()
     }
 
-    private func tick() {
-        let p = controller.player
-        if p.isPlaying { connecting = false }
-    }
-
     private var liveControls: some View {
         VStack(spacing: 8) {
             Text("Live buffer: " + String(format: "%.1f", Double(liveCaching) / 1000) + " s")
                 .font(.footnote.weight(.semibold))
                 .foregroundColor(.white)
             HStack(spacing: 12) {
-                Button(action: { changeButton(by: -1) }) {
+                Button(action: { changeBuffer(by: -1) }) {
                     Label("Lower delay", systemImage: "minus.circle")
                 }
-                Button(action: { changeButton(by: 1) }) {
+                Button(action: { changeBuffer(by: 1) }) {
                     Label("More stable", systemImage: "plus.circle")
                 }
             }
@@ -1016,3 +950,5 @@ struct PlayerView: View {
         .background(Color.black.opacity(0.65))
     }
 }
+
+// END OF FILE
