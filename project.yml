@@ -6,7 +6,7 @@ options:
 packages:
   KSPlayer:
     url: https://github.com/kingslay/KSPlayer.git
-    branch: main
+    exactVersion: 2.3.4
 targets:
   LeanIPTV:
     type: application
