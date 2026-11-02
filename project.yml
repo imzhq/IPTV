@@ -3,6 +3,10 @@ options:
   bundleIdPrefix: com.lean
   deploymentTarget:
     iOS: "15.0"
+packages:
+  KSPlayer:
+    url: https://github.com/kingslay/KSPlayer.git
+    branch: main
 targets:
   LeanIPTV:
     type: application
@@ -10,6 +14,8 @@ targets:
     sources:
       - path: ContentView.swift
       - path: LeanIPTVApp.swift
+    dependencies:
+      - package: KSPlayer
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.lean.iptv
@@ -23,6 +29,7 @@ targets:
       properties:
         CFBundleDisplayName: LeanIPTV
         UILaunchScreen: {}
+        UIBackgroundModes:
+          - audio
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
-        
