@@ -1,6 +1,7 @@
 import SwiftUI
 import UIKit
 import AVFoundation
+import AVKit
 import MobileVLCKit
 
 // MARK: - Models
@@ -52,8 +53,9 @@ struct IPTVCategory: Decodable, Identifiable {
         } else {
             categoryId = String(try c.decode(Int.self, forKey: .categoryId))
         }
-        categoryName = (try? c.decode(String.self, forKey: .categoryName)) ?? "Unnamed"
+        categoryName = (try? c.decode(String.self, forKey: categoryNameKey)) ?? "Unnamed"
     }
+    private var categoryNameKey: CodingKeys { .categoryName }
 }
 
 struct AnyKey: CodingKey {
@@ -101,30 +103,6 @@ private func intFrom(_ any: Any?, default def: Int) -> Int {
     if let s = any as? String, let i = Int(s) { return i }
     if let d = any as? Double { return Int(d) }
     return def
-}
-
-// MARK: - Floating Player Manager (Picture-in-Window)
-
-@MainActor
-class FloatingPlayerManager: ObservableObject {
-    @Published var isPiPActive = false
-    @Published var currentTitle: String = ""
-    @Published var currentURL: URL? = nil
-    
-    let controller = VLCController()
-
-    func openPiP(title: String, url: URL) {
-        currentTitle = title
-        currentURL = url
-        isPiPActive = true
-        controller.start(url: url, options: [":network-caching=1500"])
-    }
-
-    func closePiP() {
-        controller.stop()
-        isPiPActive = false
-        currentURL = nil
-    }
 }
 
 // MARK: - ViewModel
@@ -317,57 +295,25 @@ class IPTVViewModel: ObservableObject {
     }
 }
 
-// MARK: - Root Container with Floating Window Support
+// MARK: - Root View
 
 struct LiveCategoriesView: View {
     @StateObject private var model = IPTVViewModel()
-    @StateObject private var pipManager = FloatingPlayerManager()
 
     var body: some View {
-        ZStack(alignment: .bottomTrailing) {
-            NavigationView {
-                ZStack {
-                    Color.black.ignoresSafeArea()
-                    if model.isLoggedIn {
-                        HomeView(model: model)
-                    } else {
-                        LoginView(model: model)
-                    }
+        NavigationView {
+            ZStack {
+                Color.black.ignoresSafeArea()
+                if model.isLoggedIn {
+                    HomeView(model: model)
+                } else {
+                    LoginView(model: model)
                 }
-                .navigationBarHidden(true)
             }
-            .navigationViewStyle(StackNavigationViewStyle())
-            .preferredColorScheme(.dark)
-
-            // Picture-in-Window Floating Overlay Component
-            if pipManager.isPiPActive, let url = pipManager.currentURL {
-                VStack(spacing: 0) {
-                    HStack {
-                        Text(pipManager.currentTitle)
-                            .font(.caption2)
-                            .foregroundColor(.white)
-                            .lineLimit(1)
-                        Spacer()
-                        Button(action: { pipManager.closePiP() }) {
-                            Image(systemName: "xmark.circle.fill")
-                                .foregroundColor(.white)
-                                .font(.caption)
-                        }
-                    }
-                    .padding(6)
-                    .background(Color.black.opacity(0.85))
-
-                    VLCSurface(controller: pipManager.controller, onReady: {})
-                        .frame(width: 170, height: 95)
-                }
-                .frame(width: 170, height: 117)
-                .cornerRadius(10)
-                .shadow(color: .black.opacity(0.5), radius: 6, x: 0, y: 3)
-                .padding()
-                .transition(.scale.combined(with: .opacity))
-            }
+            .navigationBarHidden(true)
         }
-        .environmentObject(pipManager)
+        .navigationViewStyle(StackNavigationViewStyle())
+        .preferredColorScheme(.dark)
     }
 }
 
@@ -627,7 +573,7 @@ struct ItemDestination: View {
         case .live:
             PlayerView(title: item.name, url: model.liveURL(item), mode: .live)
         case .movies:
-            PlayerView(title: item.name, url: model.movieURL(item), mode: .vod)
+            NativeVODPlayerView(title: item.name, url: model.movieURL(item))
         case .series:
             EpisodeListView(model: model, series: item)
         }
@@ -772,9 +718,7 @@ struct EpisodeListView: View {
                 ScrollView {
                     LazyVStack(spacing: 10) {
                         ForEach(episodes) { ep in
-                            NavigationLink(destination: PlayerView(title: ep.title,
-                                                                   url: model.episodeURL(ep),
-                                                                   mode: .vod)) {
+                            NavigationLink(destination: NativeVODPlayerView(title: ep.title, url: model.episodeURL(ep))) {
                                 MediaRow(name: "S\(ep.season) E\(ep.number) · \(ep.title)",
                                          icon: nil,
                                          symbol: "play.fill",
@@ -796,7 +740,91 @@ struct EpisodeListView: View {
     }
 }
 
-// MARK: - VLC Player & Floating PiP Integration
+// MARK: - Native AVPlayer VOD View (Supports True System-Wide PiP over Other Apps)
+
+struct NativeVODPlayerView: View {
+    let title: String
+    let url: URL?
+
+    @Environment(\.presentationMode) var presentationMode
+    @State private var player = AVPlayer()
+    @State private var showControls = true
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+
+            if let url = url {
+                // Apple's Native VideoPlayer handles hardware acceleration and system PiP out-of-the-box
+                VideoPlayer(player: player)
+                    .ignoresSafeArea()
+                    .onAppear {
+                        let asset = AVURLAsset(url: url)
+                        let item = AVPlayerItem(asset: asset)
+                        player.replaceCurrentItem(with: item)
+                        player.play()
+                    }
+                    .onDisappear {
+                        player.pause()
+                        player.replaceCurrentItem(with: nil)
+                    }
+
+                // Transparent tap-catcher overlay to support collapsing custom headers
+                Rectangle()
+                    .fill(Color.clear)
+                    .contentShape(Rectangle())
+                    .ignoresSafeArea()
+                    .onTapGesture {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            showControls.toggle()
+                        }
+                    }
+            } else {
+                Text("Could not build stream URL").foregroundColor(.red)
+            }
+
+            // Custom Top Header Bar
+            if showControls && url != nil {
+                VStack {
+                    HStack(spacing: 15) {
+                        Button(action: { presentationMode.wrappedValue.dismiss() }) {
+                            Image(systemName: "chevron.left")
+                                .font(.title3.weight(.semibold))
+                                .foregroundColor(.white)
+                        }
+                        
+                        Text(title)
+                            .font(.headline)
+                            .foregroundColor(.white)
+                            .lineLimit(1)
+                        
+                        Spacer()
+                    }
+                    .padding()
+                    .background(Color.black.opacity(0.65))
+                    
+                    Spacer()
+                }
+                .transition(.opacity)
+            }
+        }
+        .navigationBarHidden(true)
+        .onAppear {
+            do {
+                try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
+                try AVAudioSession.sharedInstance().setActive(true)
+            } catch {
+                print("Audio session error: \(error)")
+            }
+            UIApplication.shared.isIdleTimerDisabled = true
+        }
+        .onDisappear {
+            UIApplication.shared.isIdleTimerDisabled = false
+        }
+    }
+}
+
+// MARK: - VLC Player (Kept for Live TV Ultra-Low Latency)
 
 enum PlaybackMode { case live, vod }
 
@@ -837,19 +865,12 @@ struct PlayerView: View {
     let mode: PlaybackMode
 
     @AppStorage("live_caching") private var liveCaching = 1500
-    @AppStorage("data_saver") private var dataSaver = true
 
     @StateObject private var controller = VLCController()
     @State private var connecting = true
     @State private var showControls = true
-    @State private var progress: Double = 0
-    @State private var scrubbing = false
-    @State private var playing = true
-    @State private var elapsed = "0:00"
-    @State private var total = "0:00"
     
     @Environment(\.presentationMode) var presentationMode
-    @EnvironmentObject var pipManager: FloatingPlayerManager
 
     private let steps = [300, 500, 800, 1200, 1500, 2000, 3000, 5000]
     private let poll = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
@@ -862,7 +883,6 @@ struct PlayerView: View {
                 VLCSurface(controller: controller, onReady: { startPlayback() })
                     .ignoresSafeArea()
 
-                // Transparent overlay tap-catcher to smoothly toggle header controls
                 Rectangle()
                     .fill(Color.clear)
                     .contentShape(Rectangle())
@@ -887,7 +907,6 @@ struct PlayerView: View {
 
             if showControls && url != nil {
                 VStack {
-                    // Custom Header Bar with PiP Minimize Button
                     HStack(spacing: 15) {
                         Button(action: { presentationMode.wrappedValue.dismiss() }) {
                             Image(systemName: "chevron.left")
@@ -901,25 +920,13 @@ struct PlayerView: View {
                             .lineLimit(1)
                         
                         Spacer()
-
-                        // Minimize to Floating Window Button
-                        if let url = url {
-                            Button(action: {
-                                pipManager.openPiP(title: title, url: url)
-                                presentationMode.wrappedValue.dismiss()
-                            }) {
-                                Image(systemName: "pip.enter")
-                                    .font(.title3.weight(.semibold))
-                                    .foregroundColor(.white)
-                            }
-                        }
                     }
                     .padding()
                     .background(Color.black.opacity(0.65))
                     
                     Spacer()
                     
-                    controlsPanel
+                    liveControls
                 }
                 .transition(.opacity)
             }
@@ -944,20 +951,10 @@ struct PlayerView: View {
     private func startPlayback() {
         guard let url = url else { return }
         connecting = true
-        var opts: [String]
-        switch mode {
-        case .live:
-            opts = [":network-caching=\(liveCaching)",
+        let opts = [":network-caching=\(liveCaching)",
                     ":live-caching=\(liveCaching)",
                     ":clock-jitter=0",
                     ":clock-synchro=0"]
-        case .vod:
-            let cache = dataSaver ? 1500 : 4000
-            opts = [":network-caching=\(cache)"]
-            if dataSaver {
-                opts += [":adaptive-maxheight=720", ":adaptive-maxwidth=1280"]
-            }
-        }
         controller.start(url: url, options: opts)
     }
 
@@ -970,38 +967,7 @@ struct PlayerView: View {
 
     private func tick() {
         let p = controller.player
-        playing = p.isPlaying
         if p.isPlaying { connecting = false }
-        if mode == .vod && !scrubbing {
-            progress = Double(p.position)
-            elapsed = clock(Int(p.time.intValue))
-            total = clock(Int(p.media?.length.intValue ?? 0))
-        }
-    }
-
-    private func seek(by seconds: Double) {
-        let p = controller.player
-        let lengthMs = Double(p.media?.length.intValue ?? 0)
-        guard lengthMs > 0 else { return }
-        let newPos = Double(p.position) + (seconds * 1000) / lengthMs
-        p.position = Float(min(max(newPos, 0), 0.999))
-    }
-
-    private func clock(_ ms: Int) -> String {
-        let s = max(ms, 0) / 1000
-        let h = s / 3600
-        let m = (s % 3600) / 60
-        let sec = s % 60
-        if h > 0 { return String(format: "%d:%02d:%02d", h, m, sec) }
-        return String(format: "%d:%02d", m, sec)
-    }
-
-    @ViewBuilder
-    private var controlsPanel: some View {
-        switch mode {
-        case .live: liveControls
-        case .vod: vodControls
-        }
     }
 
     private var liveControls: some View {
@@ -1025,37 +991,6 @@ struct PlayerView: View {
         }
         .padding(12)
         .frame(maxWidth: .infinity)
-        .background(Color.black.opacity(0.65))
-    }
-
-    private var vodControls: some View {
-        VStack(spacing: 6) {
-            Slider(value: $progress, in: 0...1, onEditingChanged: { editing in
-                scrubbing = editing
-                if !editing { controller.player.position = Float(progress) }
-            })
-            HStack {
-                Text(elapsed).font(.caption2).foregroundColor(.white)
-                Spacer()
-                Text(total).font(.caption2).foregroundColor(.white)
-            }
-            HStack(spacing: 30) {
-                Button(action: { seek(by: -30) }) {
-                    Image(systemName: "gobackward.30").font(.title2)
-                }
-                Button(action: {
-                    if controller.player.isPlaying { controller.player.pause() }
-                    else { controller.player.play() }
-                }) {
-                    Image(systemName: playing ? "pause.fill" : "play.fill").font(.title)
-                }
-                Button(action: { seek(by: 30) }) {
-                    Image(systemName: "goforward.30").font(.title2)
-                }
-            }
-            .foregroundColor(.white)
-        }
-        .padding(12)
         .background(Color.black.opacity(0.65))
     }
 }
