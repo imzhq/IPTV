@@ -739,14 +739,14 @@ struct MovieSurface: UIViewRepresentable {
         // If the built-in player can't open a format, KSPlayer falls back to its FFmpeg player
         KSOptions.secondPlayerType = KSMEPlayer.self
 
-        let options = KSOptions()
-        options.isAutoPlay = true
+        // In this KSPlayer version these settings are set on the type, not on each options object
+        KSOptions.isAutoPlay = true
         // Smaller buffers download less video ahead of what you are watching
-        options.preferredForwardBufferDuration = dataSaver ? 2 : 4
-        options.maxBufferDuration = dataSaver ? 15 : 40
+        KSOptions.preferredForwardBufferDuration = dataSaver ? 2 : 4
+        KSOptions.maxBufferDuration = dataSaver ? 15 : 40
 
         let view = IOSVideoPlayerView()
-        view.set(url: url, options: options)
+        view.set(url: url, options: KSOptions())
         return view
     }
 
