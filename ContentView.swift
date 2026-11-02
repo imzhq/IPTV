@@ -2,7 +2,6 @@ import SwiftUI
 import UIKit
 import AVFoundation
 import MobileVLCKit
-import KSPlayer
 
 // MARK: - Models
 
@@ -11,6 +10,21 @@ enum ContentKind: String, CaseIterable, Identifiable {
     case movies = "Movies"
     case series = "Series"
     var id: String { rawValue }
+}
+
+enum HomeTab: String, CaseIterable, Identifiable {
+    case live = "Live TV"
+    case movies = "Movies"
+    case series = "Series"
+    var id: String { rawValue }
+
+    var kind: ContentKind? {
+        switch self {
+        case .live: return .live
+        case .movies: return .movies
+        case .series: return .series
+        }
+    }
 }
 
 func symbolName(for kind: ContentKind) -> String {
@@ -89,6 +103,30 @@ private func intFrom(_ any: Any?, default def: Int) -> Int {
     return def
 }
 
+// MARK: - Floating Player Manager (Picture-in-Window)
+
+@MainActor
+class FloatingPlayerManager: ObservableObject {
+    @Published var isPiPActive = false
+    @Published var currentTitle: String = ""
+    @Published var currentURL: URL? = nil
+    
+    let controller = VLCController()
+
+    func openPiP(title: String, url: URL) {
+        currentTitle = title
+        currentURL = url
+        isPiPActive = true
+        controller.start(url: url, options: [":network-caching=1500"])
+    }
+
+    func closePiP() {
+        controller.stop()
+        isPiPActive = false
+        currentURL = nil
+    }
+}
+
 // MARK: - ViewModel
 
 @MainActor
@@ -133,7 +171,6 @@ class IPTVViewModel: ObservableObject {
         request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
         let (data, response) = try await URLSession.shared.data(for: request)
         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-            print("❌ HTTP status: \(http.statusCode)")
             throw URLError(.badServerResponse)
         }
         return data
@@ -256,12 +293,10 @@ class IPTVViewModel: ObservableObject {
             }
             return result.sorted { ($0.season, $0.number) < ($1.season, $1.number) }
         } catch {
-            errorMessage = "Episodes failed: \(error.localizedDescription)"
             return []
         }
     }
 
-    // Raw .ts feed for live (lowest delay). If a channel is black, try ".m3u8" instead of ".ts".
     func liveURL(_ item: MediaItem) -> URL? {
         URL(string: "\(baseURL)/live/\(u)/\(p)/\(item.id).ts")
     }
@@ -282,25 +317,57 @@ class IPTVViewModel: ObservableObject {
     }
 }
 
-// MARK: - Root View (kept as LiveCategoriesView so LeanIPTVApp.swift still works)
+// MARK: - Root Container with Floating Window Support
 
 struct LiveCategoriesView: View {
     @StateObject private var model = IPTVViewModel()
+    @StateObject private var pipManager = FloatingPlayerManager()
 
     var body: some View {
-        NavigationView {
-            ZStack {
-                Color.black.ignoresSafeArea()
-                if model.isLoggedIn {
-                    HomeView(model: model)
-                } else {
-                    LoginView(model: model)
+        ZStack(alignment: .bottomTrailing) {
+            NavigationView {
+                ZStack {
+                    Color.black.ignoresSafeArea()
+                    if model.isLoggedIn {
+                        HomeView(model: model)
+                    } else {
+                        LoginView(model: model)
+                    }
                 }
+                .navigationBarHidden(true)
             }
-            .navigationBarHidden(true)
+            .navigationViewStyle(StackNavigationViewStyle())
+            .preferredColorScheme(.dark)
+
+            // Picture-in-Window Floating Overlay Component
+            if pipManager.isPiPActive, let url = pipManager.currentURL {
+                VStack(spacing: 0) {
+                    HStack {
+                        Text(pipManager.currentTitle)
+                            .font(.caption2)
+                            .foregroundColor(.white)
+                            .lineLimit(1)
+                        Spacer()
+                        Button(action: { pipManager.closePiP() }) {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundColor(.white)
+                                .font(.caption)
+                        }
+                    }
+                    .padding(6)
+                    .background(Color.black.opacity(0.85))
+
+                    VLCSurface(controller: pipManager.controller, onReady: {})
+                        .frame(width: 170, height: 95)
+                }
+                .frame(width: 170, height: 117)
+                .cornerRadius(10)
+                .shadow(color: .black.opacity(0.5), radius: 6, x: 0, y: 3)
+                .padding()
+                .transition(.scale.combined(with: .opacity))
+            }
         }
-        .navigationViewStyle(StackNavigationViewStyle())
-        .preferredColorScheme(.dark)
+        .environmentObject(pipManager)
     }
 }
 
@@ -368,10 +435,11 @@ struct LoginView: View {
 
 struct HomeView: View {
     @ObservedObject var model: IPTVViewModel
-    @State private var kind: ContentKind = .live
+    @State private var tab: HomeTab = .live
     @State private var query = ""
     @AppStorage("data_saver") private var dataSaver = true
 
+    private var kind: ContentKind { tab.kind ?? .live }
     private var cats: [IPTVCategory] { model.categories[kind] ?? [] }
     private var cleanQuery: String { query.trimmingCharacters(in: .whitespaces) }
 
@@ -379,9 +447,9 @@ struct HomeView: View {
         VStack(alignment: .leading, spacing: 12) {
             header
 
-            Picker("Section", selection: $kind) {
-                ForEach(ContentKind.allCases) { k in
-                    Text(k.rawValue).tag(k)
+            Picker("Section", selection: $tab) {
+                ForEach(HomeTab.allCases) { t in
+                    Text(t.rawValue).tag(t)
                 }
             }
             .pickerStyle(SegmentedPickerStyle())
@@ -407,14 +475,12 @@ struct HomeView: View {
                 SearchResultsView(model: model, kind: kind, query: cleanQuery)
             }
         }
-        .task(id: kind) {
-            if model.categories[kind] == nil {
-                await model.loadCategories(kind)
+        .task(id: tab) {
+            if let k = tab.kind, model.categories[k] == nil {
+                await model.loadCategories(k)
             }
         }
-        .onChange(of: kind) { _ in
-            query = ""
-        }
+        .onChange(of: tab) { _ in query = "" }
         .onChange(of: query) { _ in
             if !cleanQuery.isEmpty {
                 Task { await model.loadLibrary(kind) }
@@ -559,9 +625,9 @@ struct ItemDestination: View {
     var body: some View {
         switch kind {
         case .live:
-            LivePlayerView(title: item.name, url: model.liveURL(item))
+            PlayerView(title: item.name, url: model.liveURL(item), mode: .live)
         case .movies:
-            MoviePlayerView(title: item.name, url: model.movieURL(item))
+            PlayerView(title: item.name, url: model.movieURL(item), mode: .vod)
         case .series:
             EpisodeListView(model: model, series: item)
         }
@@ -706,7 +772,9 @@ struct EpisodeListView: View {
                 ScrollView {
                     LazyVStack(spacing: 10) {
                         ForEach(episodes) { ep in
-                            NavigationLink(destination: MoviePlayerView(title: ep.title, url: model.episodeURL(ep))) {
+                            NavigationLink(destination: PlayerView(title: ep.title,
+                                                                   url: model.episodeURL(ep),
+                                                                   mode: .vod)) {
                                 MediaRow(name: "S\(ep.season) E\(ep.number) · \(ep.title)",
                                          icon: nil,
                                          symbol: "play.fill",
@@ -728,65 +796,9 @@ struct EpisodeListView: View {
     }
 }
 
-// MARK: - Movies and series player (KSPlayer, with picture in picture)
+// MARK: - VLC Player & Floating PiP Integration
 
-// Wraps KSPlayer's ready-made player view, which has its own controls and a picture-in-picture button
-struct MovieSurface: UIViewRepresentable {
-    let url: URL
-    let dataSaver: Bool
-
-    func makeUIView(context: Context) -> IOSVideoPlayerView {
-        // If the built-in player can't open a format, KSPlayer falls back to its FFmpeg player
-        KSOptions.secondPlayerType = KSMEPlayer.self
-
-        // In this KSPlayer version these settings are set on the type, not on each options object
-        KSOptions.isAutoPlay = true
-        // Smaller buffers download less video ahead of what you are watching
-        KSOptions.preferredForwardBufferDuration = dataSaver ? 2 : 4
-        KSOptions.maxBufferDuration = dataSaver ? 15 : 40
-
-        let view = IOSVideoPlayerView()
-        view.set(url: url, options: KSOptions())
-        return view
-    }
-
-    func updateUIView(_ uiView: IOSVideoPlayerView, context: Context) {}
-}
-
-struct MoviePlayerView: View {
-    let title: String
-    let url: URL?
-
-    @AppStorage("data_saver") private var dataSaver = true
-
-    var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-            if let url = url {
-                MovieSurface(url: url, dataSaver: dataSaver)
-                    .ignoresSafeArea(edges: .bottom)
-            } else {
-                Text("Could not build stream URL").foregroundColor(.red)
-            }
-        }
-        .navigationBarTitle(title, displayMode: .inline)
-        .navigationBarHidden(false)
-        .onAppear {
-            do {
-                try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
-                try AVAudioSession.sharedInstance().setActive(true)
-            } catch {
-                print("Audio session error: \(error)")
-            }
-            UIApplication.shared.isIdleTimerDisabled = true
-        }
-        .onDisappear {
-            UIApplication.shared.isIdleTimerDisabled = false
-        }
-    }
-}
-
-// MARK: - Live TV player (VLC, low delay)
+enum PlaybackMode { case live, vod }
 
 final class VLCController: ObservableObject {
     let player = VLCMediaPlayer()
@@ -819,17 +831,25 @@ struct VLCSurface: UIViewRepresentable {
     func updateUIView(_ uiView: UIView, context: Context) {}
 }
 
-struct LivePlayerView: View {
+struct PlayerView: View {
     let title: String
     let url: URL?
+    let mode: PlaybackMode
 
-    @AppStorage("live_caching") private var liveCaching = 1500   // ms of buffer for live TV
+    @AppStorage("live_caching") private var liveCaching = 1500
+    @AppStorage("data_saver") private var dataSaver = true
 
     @StateObject private var controller = VLCController()
     @State private var connecting = true
     @State private var showControls = true
-
+    @State private var progress: Double = 0
+    @State private var scrubbing = false
+    @State private var playing = true
+    @State private var elapsed = "0:00"
+    @State private var total = "0:00"
+    
     @Environment(\.presentationMode) var presentationMode
+    @EnvironmentObject var pipManager: FloatingPlayerManager
 
     private let steps = [300, 500, 800, 1200, 1500, 2000, 3000, 5000]
     private let poll = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
@@ -842,6 +862,7 @@ struct LivePlayerView: View {
                 VLCSurface(controller: controller, onReady: { startPlayback() })
                     .ignoresSafeArea()
 
+                // Transparent overlay tap-catcher to smoothly toggle header controls
                 Rectangle()
                     .fill(Color.clear)
                     .contentShape(Rectangle())
@@ -866,26 +887,39 @@ struct LivePlayerView: View {
 
             if showControls && url != nil {
                 VStack {
+                    // Custom Header Bar with PiP Minimize Button
                     HStack(spacing: 15) {
                         Button(action: { presentationMode.wrappedValue.dismiss() }) {
                             Image(systemName: "chevron.left")
                                 .font(.title3.weight(.semibold))
                                 .foregroundColor(.white)
                         }
-
+                        
                         Text(title)
                             .font(.headline)
                             .foregroundColor(.white)
                             .lineLimit(1)
-
+                        
                         Spacer()
+
+                        // Minimize to Floating Window Button
+                        if let url = url {
+                            Button(action: {
+                                pipManager.openPiP(title: title, url: url)
+                                presentationMode.wrappedValue.dismiss()
+                            }) {
+                                Image(systemName: "pip.enter")
+                                    .font(.title3.weight(.semibold))
+                                    .foregroundColor(.white)
+                            }
+                        }
                     }
                     .padding()
                     .background(Color.black.opacity(0.65))
-
+                    
                     Spacer()
-
-                    liveControls
+                    
+                    controlsPanel
                 }
                 .transition(.opacity)
             }
@@ -904,18 +938,26 @@ struct LivePlayerView: View {
             controller.stop()
             UIApplication.shared.isIdleTimerDisabled = false
         }
-        .onReceive(poll) { _ in
-            if controller.player.isPlaying { connecting = false }
-        }
+        .onReceive(poll) { _ in tick() }
     }
 
     private func startPlayback() {
         guard let url = url else { return }
         connecting = true
-        let opts = [":network-caching=\(liveCaching)",
+        var opts: [String]
+        switch mode {
+        case .live:
+            opts = [":network-caching=\(liveCaching)",
                     ":live-caching=\(liveCaching)",
                     ":clock-jitter=0",
                     ":clock-synchro=0"]
+        case .vod:
+            let cache = dataSaver ? 1500 : 4000
+            opts = [":network-caching=\(cache)"]
+            if dataSaver {
+                opts += [":adaptive-maxheight=720", ":adaptive-maxwidth=1280"]
+            }
+        }
         controller.start(url: url, options: opts)
     }
 
@@ -924,6 +966,42 @@ struct LivePlayerView: View {
         let newIdx = min(max(idx + direction, 0), steps.count - 1)
         liveCaching = steps[newIdx]
         startPlayback()
+    }
+
+    private func tick() {
+        let p = controller.player
+        playing = p.isPlaying
+        if p.isPlaying { connecting = false }
+        if mode == .vod && !scrubbing {
+            progress = Double(p.position)
+            elapsed = clock(Int(p.time.intValue))
+            total = clock(Int(p.media?.length.intValue ?? 0))
+        }
+    }
+
+    private func seek(by seconds: Double) {
+        let p = controller.player
+        let lengthMs = Double(p.media?.length.intValue ?? 0)
+        guard lengthMs > 0 else { return }
+        let newPos = Double(p.position) + (seconds * 1000) / lengthMs
+        p.position = Float(min(max(newPos, 0), 0.999))
+    }
+
+    private func clock(_ ms: Int) -> String {
+        let s = max(ms, 0) / 1000
+        let h = s / 3600
+        let m = (s % 3600) / 60
+        let sec = s % 60
+        if h > 0 { return String(format: "%d:%02d:%02d", h, m, sec) }
+        return String(format: "%d:%02d", m, sec)
+    }
+
+    @ViewBuilder
+    private var controlsPanel: some View {
+        switch mode {
+        case .live: liveControls
+        case .vod: vodControls
+        }
     }
 
     private var liveControls: some View {
@@ -949,6 +1027,35 @@ struct LivePlayerView: View {
         .frame(maxWidth: .infinity)
         .background(Color.black.opacity(0.65))
     }
-}
 
-// END OF FILE
+    private var vodControls: some View {
+        VStack(spacing: 6) {
+            Slider(value: $progress, in: 0...1, onEditingChanged: { editing in
+                scrubbing = editing
+                if !editing { controller.player.position = Float(progress) }
+            })
+            HStack {
+                Text(elapsed).font(.caption2).foregroundColor(.white)
+                Spacer()
+                Text(total).font(.caption2).foregroundColor(.white)
+            }
+            HStack(spacing: 30) {
+                Button(action: { seek(by: -30) }) {
+                    Image(systemName: "gobackward.30").font(.title2)
+                }
+                Button(action: {
+                    if controller.player.isPlaying { controller.player.pause() }
+                    else { controller.player.play() }
+                }) {
+                    Image(systemName: playing ? "pause.fill" : "play.fill").font(.title)
+                }
+                Button(action: { seek(by: 30) }) {
+                    Image(systemName: "goforward.30").font(.title2)
+                }
+            }
+            .foregroundColor(.white)
+        }
+        .padding(12)
+        .background(Color.black.opacity(0.65))
+    }
+}
