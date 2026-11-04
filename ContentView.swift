@@ -774,14 +774,15 @@ struct KSPlayerVODView: View {
     @Environment(\.presentationMode) var presentationMode
     @State private var showControls = true
     @AppStorage("data_saver") private var dataSaver = true
+    @StateObject private var coordinator = KSVideoPlayer.Coordinator()
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
 
             if let url = url {
-                // KSPlayer uses KSVideoPlayer view initialized with a URL and resource options
-                KSVideoPlayer(url: url)
+                // KSPlayer initialized correctly with coordinator, url, and options
+                KSVideoPlayer(coordinator: coordinator, url: url, options: KSOptions())
                     .edgesIgnoringSafeArea(.all)
                     .onAppear {
                         if dataSaver {
