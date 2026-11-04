@@ -22,7 +22,7 @@ func symbolName(for kind: ContentKind) -> String {
     }
 }
 
-struct IPTVCategory: Decodable, Identifiable, Codable {
+struct IPTVCategory: Codable, Identifiable {
     var id: String { categoryId }
     let categoryId: String
     let categoryName: String
@@ -55,7 +55,7 @@ struct AnyKey: CodingKey {
     init?(intValue: Int) { return nil }
 }
 
-struct MediaItem: Decodable, Identifiable, Codable {
+struct MediaItem: Codable, Identifiable {
     let id: Int
     let name: String
     let searchKey: String
@@ -780,19 +780,19 @@ struct KSPlayerVODView: View {
             Color.black.ignoresSafeArea()
 
             if let url = url {
-                // KSPlayer handles .mkv, .avi, and custom codecs out of the box with built-in PiP
-                VideoPlayerView(url: url, options: KSPlayerManager.options)
-                    .ignoresSafeArea()
+                // KSPlayer uses KSVideoPlayer view initialized with a URL and resource options
+                KSVideoPlayer(url: url)
+                    .edgesIgnoringSafeArea(.all)
                     .onAppear {
                         if dataSaver {
-                            // Enforce data saver cap settings here if needed via KSPlayerManager options
+                            // Enforce custom buffer/bitrate options if configured
                         }
                     }
 
                 Rectangle()
                     .fill(Color.clear)
                     .contentShape(Rectangle())
-                    .ignoresSafeArea()
+                    .edgesIgnoringSafeArea(.all)
                     .onTapGesture {
                         withAnimation(.easeInOut(duration: 0.2)) {
                             showControls.toggle()
