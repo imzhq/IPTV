@@ -13,21 +13,6 @@ enum ContentKind: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-enum HomeTab: String, CaseIterable, Identifiable {
-    case live = "Live TV"
-    case movies = "Movies"
-    case series = "Series"
-    var id: String { rawValue }
-
-    var kind: ContentKind? {
-        switch self {
-        case .live: return .live
-        case .movies: return .movies
-        case .series: return .series
-        }
-    }
-}
-
 func symbolName(for kind: ContentKind) -> String {
     switch kind {
     case .live: return "play.fill"
@@ -53,9 +38,8 @@ struct IPTVCategory: Decodable, Identifiable {
         } else {
             categoryId = String(try c.decode(Int.self, forKey: .categoryId))
         }
-        categoryName = (try? c.decode(String.self, forKey: categoryNameKey)) ?? "Unnamed"
+        categoryName = (try? c.decode(String.self, forKey: .categoryName)) ?? "Unnamed"
     }
-    private var categoryNameKey: CodingKeys { .categoryName }
 }
 
 struct AnyKey: CodingKey {
@@ -149,6 +133,7 @@ class IPTVViewModel: ObservableObject {
         request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
         let (data, response) = try await URLSession.shared.data(for: request)
         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+            print("❌ HTTP status: \(http.statusCode)")
             throw URLError(.badServerResponse)
         }
         return data
@@ -271,10 +256,12 @@ class IPTVViewModel: ObservableObject {
             }
             return result.sorted { ($0.season, $0.number) < ($1.season, $1.number) }
         } catch {
+            errorMessage = "Episodes failed: \(error.localizedDescription)"
             return []
         }
     }
 
+    // Raw .ts feed for live (lowest delay). If a channel is black, try ".m3u8" instead of ".ts".
     func liveURL(_ item: MediaItem) -> URL? {
         URL(string: "\(baseURL)/live/\(u)/\(p)/\(item.id).ts")
     }
@@ -295,7 +282,7 @@ class IPTVViewModel: ObservableObject {
     }
 }
 
-// MARK: - Root View
+// MARK: - Root View (kept as LiveCategoriesView so LeanIPTVApp.swift still works)
 
 struct LiveCategoriesView: View {
     @StateObject private var model = IPTVViewModel()
@@ -381,11 +368,10 @@ struct LoginView: View {
 
 struct HomeView: View {
     @ObservedObject var model: IPTVViewModel
-    @State private var tab: HomeTab = .live
+    @State private var kind: ContentKind = .live
     @State private var query = ""
     @AppStorage("data_saver") private var dataSaver = true
 
-    private var kind: ContentKind { tab.kind ?? .live }
     private var cats: [IPTVCategory] { model.categories[kind] ?? [] }
     private var cleanQuery: String { query.trimmingCharacters(in: .whitespaces) }
 
@@ -393,9 +379,9 @@ struct HomeView: View {
         VStack(alignment: .leading, spacing: 12) {
             header
 
-            Picker("Section", selection: $tab) {
-                ForEach(HomeTab.allCases) { t in
-                    Text(t.rawValue).tag(t)
+            Picker("Section", selection: $kind) {
+                ForEach(ContentKind.allCases) { k in
+                    Text(k.rawValue).tag(k)
                 }
             }
             .pickerStyle(SegmentedPickerStyle())
@@ -421,12 +407,14 @@ struct HomeView: View {
                 SearchResultsView(model: model, kind: kind, query: cleanQuery)
             }
         }
-        .task(id: tab) {
-            if let k = tab.kind, model.categories[k] == nil {
-                await model.loadCategories(k)
+        .task(id: kind) {
+            if model.categories[kind] == nil {
+                await model.loadCategories(kind)
             }
         }
-        .onChange(of: tab) { _ in query = "" }
+        .onChange(of: kind) { _ in
+            query = ""
+        }
         .onChange(of: query) { _ in
             if !cleanQuery.isEmpty {
                 Task { await model.loadLibrary(kind) }
@@ -571,9 +559,9 @@ struct ItemDestination: View {
     var body: some View {
         switch kind {
         case .live:
-            PlayerView(title: item.name, url: model.liveURL(item), mode: .live)
+            LivePlayerView(title: item.name, url: model.liveURL(item))
         case .movies:
-            NativeVODPlayerView(title: item.name, url: model.movieURL(item))
+            MoviePlayerView(title: item.name, url: model.movieURL(item))
         case .series:
             EpisodeListView(model: model, series: item)
         }
@@ -718,7 +706,7 @@ struct EpisodeListView: View {
                 ScrollView {
                     LazyVStack(spacing: 10) {
                         ForEach(episodes) { ep in
-                            NavigationLink(destination: NativeVODPlayerView(title: ep.title, url: model.episodeURL(ep))) {
+                            NavigationLink(destination: MoviePlayerView(title: ep.title, url: model.episodeURL(ep))) {
                                 MediaRow(name: "S\(ep.season) E\(ep.number) · \(ep.title)",
                                          icon: nil,
                                          symbol: "play.fill",
@@ -740,75 +728,91 @@ struct EpisodeListView: View {
     }
 }
 
-// MARK: - Native AVPlayer VOD View (Supports True System-Wide PiP over Other Apps)
+// MARK: - Movies and series player (Apple's native player, with picture in picture)
 
-struct NativeVODPlayerView: View {
+final class NativePlayerModel: ObservableObject {
+    @Published var failed = false
+    @Published var errorText = ""
+    let player = AVPlayer()
+
+    private var statusObserver: NSKeyValueObservation?
+    private var started = false
+
+    func start(url: URL, dataSaver: Bool) {
+        guard !started else { return }
+        started = true
+        failed = false
+
+        let item = AVPlayerItem(url: url)
+        if dataSaver {
+            // Smaller read-ahead, and a cap on quality for streams that offer several qualities
+            item.preferredForwardBufferDuration = 5
+            item.preferredMaximumResolution = CGSize(width: 1280, height: 720)
+            item.preferredPeakBitRate = 3_000_000
+        }
+        statusObserver = item.observe(\.status, options: [.new]) { [weak self] observed, _ in
+            DispatchQueue.main.async {
+                if observed.status == .failed {
+                    self?.errorText = observed.error?.localizedDescription ?? "Unknown error"
+                    self?.failed = true
+                }
+            }
+        }
+        player.replaceCurrentItem(with: item)
+        player.play()
+    }
+
+    func stop() {
+        statusObserver = nil
+        player.pause()
+        player.replaceCurrentItem(with: nil)
+        started = false
+    }
+}
+
+// Apple's own player screen: seek bar, 10-second skip, AirPlay and the picture-in-picture button
+struct NativeVideoPlayer: UIViewControllerRepresentable {
+    let player: AVPlayer
+
+    func makeUIViewController(context: Context) -> AVPlayerViewController {
+        let vc = AVPlayerViewController()
+        vc.player = player
+        vc.allowsPictureInPicturePlayback = true
+        vc.canStartPictureInPictureAutomaticallyFromInline = true
+        vc.entersFullScreenWhenPlaybackBegins = false
+        return vc
+    }
+
+    func updateUIViewController(_ uiViewController: AVPlayerViewController, context: Context) {}
+}
+
+struct MoviePlayerView: View {
     let title: String
     let url: URL?
 
-    @Environment(\.presentationMode) var presentationMode
-    @State private var player = AVPlayer()
-    @State private var showControls = true
+    @AppStorage("data_saver") private var dataSaver = true
+    @StateObject private var model = NativePlayerModel()
+    @State private var useVLC = false
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-
             if let url = url {
-                // Apple's Native VideoPlayer handles hardware acceleration and system PiP out-of-the-box
-                VideoPlayer(player: player)
-                    .ignoresSafeArea()
-                    .onAppear {
-                        let asset = AVURLAsset(url: url)
-                        let item = AVPlayerItem(asset: asset)
-                        player.replaceCurrentItem(with: item)
-                        player.play()
+                if useVLC {
+                    VLCMovieView(url: url, dataSaver: dataSaver)
+                } else {
+                    NativeVideoPlayer(player: model.player)
+                        .ignoresSafeArea(edges: .bottom)
+                    if model.failed {
+                        failureOverlay
                     }
-                    .onDisappear {
-                        player.pause()
-                        player.replaceCurrentItem(with: nil)
-                    }
-
-                // Transparent tap-catcher overlay to support collapsing custom headers
-                Rectangle()
-                    .fill(Color.clear)
-                    .contentShape(Rectangle())
-                    .ignoresSafeArea()
-                    .onTapGesture {
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            showControls.toggle()
-                        }
-                    }
+                }
             } else {
                 Text("Could not build stream URL").foregroundColor(.red)
             }
-
-            // Custom Top Header Bar
-            if showControls && url != nil {
-                VStack {
-                    HStack(spacing: 15) {
-                        Button(action: { presentationMode.wrappedValue.dismiss() }) {
-                            Image(systemName: "chevron.left")
-                                .font(.title3.weight(.semibold))
-                                .foregroundColor(.white)
-                        }
-                        
-                        Text(title)
-                            .font(.headline)
-                            .foregroundColor(.white)
-                            .lineLimit(1)
-                        
-                        Spacer()
-                    }
-                    .padding()
-                    .background(Color.black.opacity(0.65))
-                    
-                    Spacer()
-                }
-                .transition(.opacity)
-            }
         }
-        .navigationBarHidden(true)
+        .navigationBarTitle(title, displayMode: .inline)
+        .navigationBarHidden(false)
         .onAppear {
             do {
                 try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
@@ -817,16 +821,151 @@ struct NativeVODPlayerView: View {
                 print("Audio session error: \(error)")
             }
             UIApplication.shared.isIdleTimerDisabled = true
+            if let url = url, !useVLC {
+                model.start(url: url, dataSaver: dataSaver)
+            }
         }
         .onDisappear {
+            model.stop()
             UIApplication.shared.isIdleTimerDisabled = false
         }
     }
+
+    private var failureOverlay: some View {
+        VStack(spacing: 12) {
+            Text("Apple's player can't play this video")
+                .font(.headline)
+                .foregroundColor(.white)
+                .multilineTextAlignment(.center)
+            Text("It is probably in a format iOS doesn't support, such as .mkv.")
+                .font(.caption)
+                .foregroundColor(.gray)
+                .multilineTextAlignment(.center)
+            Text(model.errorText)
+                .font(.caption2)
+                .foregroundColor(.gray)
+                .multilineTextAlignment(.center)
+            Button(action: {
+                model.stop()
+                useVLC = true
+            }) {
+                Text("Play with VLC (no picture-in-picture)")
+                    .font(.footnote.weight(.semibold))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(Color.red.opacity(0.85))
+                    .foregroundColor(.white)
+                    .cornerRadius(10)
+            }
+        }
+        .padding()
+        .background(Color.black.opacity(0.9))
+        .cornerRadius(12)
+        .padding()
+    }
 }
 
-// MARK: - VLC Player (Kept for Live TV Ultra-Low Latency)
+// MARK: - VLC fallback for movies Apple's player can't open
 
-enum PlaybackMode { case live, vod }
+struct VLCMovieView: View {
+    let url: URL
+    let dataSaver: Bool
+
+    @StateObject private var controller = VLCController()
+    @State private var connecting = true
+    @State private var progress: Double = 0
+    @State private var scrubbing = false
+    @State private var playing = true
+    @State private var elapsed = "0:00"
+    @State private var total = "0:00"
+
+    private let poll = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        ZStack(alignment: .bottom) {
+            VLCSurface(controller: controller, onReady: { startPlayback() })
+                .ignoresSafeArea(edges: .bottom)
+
+            if connecting {
+                ProgressView()
+                    .scaleEffect(1.2)
+                    .frame(maxHeight: .infinity)
+            }
+
+            controls
+        }
+        .onDisappear {
+            controller.stop()
+        }
+        .onReceive(poll) { _ in tick() }
+    }
+
+    private func startPlayback() {
+        connecting = true
+        controller.start(url: url, options: [":network-caching=\(dataSaver ? 1500 : 4000)"])
+    }
+
+    private func tick() {
+        let p = controller.player
+        playing = p.isPlaying
+        if p.isPlaying { connecting = false }
+        if !scrubbing {
+            progress = Double(p.position)
+            elapsed = clock(Int(p.time.intValue))
+            total = clock(Int(p.media?.length.intValue ?? 0))
+        }
+    }
+
+    private func seek(by seconds: Double) {
+        let p = controller.player
+        let lengthMs = Double(p.media?.length.intValue ?? 0)
+        guard lengthMs > 0 else { return }
+        let newPos = Double(p.position) + (seconds * 1000) / lengthMs
+        p.position = Float(min(max(newPos, 0), 0.999))
+    }
+
+    private func clock(_ ms: Int) -> String {
+        let s = max(ms, 0) / 1000
+        let h = s / 3600
+        let m = (s % 3600) / 60
+        let sec = s % 60
+        if h > 0 { return String(format: "%d:%02d:%02d", h, m, sec) }
+        return String(format: "%d:%02d", m, sec)
+    }
+
+    private var controls: some View {
+        VStack(spacing: 6) {
+            Slider(value: $progress, in: 0...1, onEditingChanged: { editing in
+                scrubbing = editing
+                if !editing { controller.player.position = Float(progress) }
+            })
+            HStack {
+                Text(elapsed).font(.caption2).foregroundColor(.white)
+                Spacer()
+                Text(total).font(.caption2).foregroundColor(.white)
+            }
+            HStack(spacing: 30) {
+                Button(action: { seek(by: -30) }) {
+                    Image(systemName: "gobackward.30").font(.title2)
+                }
+                Button(action: {
+                    if controller.player.isPlaying { controller.player.pause() }
+                    else { controller.player.play() }
+                }) {
+                    Image(systemName: playing ? "pause.fill" : "play.fill").font(.title)
+                }
+                Button(action: { seek(by: 30) }) {
+                    Image(systemName: "goforward.30").font(.title2)
+                }
+            }
+            .foregroundColor(.white)
+        }
+        .padding(12)
+        .background(Color.black.opacity(0.65))
+    }
+}
+
+// MARK: - Live TV player (VLC, low delay)
 
 final class VLCController: ObservableObject {
     let player = VLCMediaPlayer()
@@ -859,17 +998,16 @@ struct VLCSurface: UIViewRepresentable {
     func updateUIView(_ uiView: UIView, context: Context) {}
 }
 
-struct PlayerView: View {
+struct LivePlayerView: View {
     let title: String
     let url: URL?
-    let mode: PlaybackMode
 
-    @AppStorage("live_caching") private var liveCaching = 1500
+    @AppStorage("live_caching") private var liveCaching = 1500   // ms of buffer for live TV
 
     @StateObject private var controller = VLCController()
     @State private var connecting = true
     @State private var showControls = true
-    
+
     @Environment(\.presentationMode) var presentationMode
 
     private let steps = [300, 500, 800, 1200, 1500, 2000, 3000, 5000]
@@ -913,19 +1051,19 @@ struct PlayerView: View {
                                 .font(.title3.weight(.semibold))
                                 .foregroundColor(.white)
                         }
-                        
+
                         Text(title)
                             .font(.headline)
                             .foregroundColor(.white)
                             .lineLimit(1)
-                        
+
                         Spacer()
                     }
                     .padding()
                     .background(Color.black.opacity(0.65))
-                    
+
                     Spacer()
-                    
+
                     liveControls
                 }
                 .transition(.opacity)
@@ -945,7 +1083,9 @@ struct PlayerView: View {
             controller.stop()
             UIApplication.shared.isIdleTimerDisabled = false
         }
-        .onReceive(poll) { _ in tick() }
+        .onReceive(poll) { _ in
+            if controller.player.isPlaying { connecting = false }
+        }
     }
 
     private func startPlayback() {
@@ -963,11 +1103,6 @@ struct PlayerView: View {
         let newIdx = min(max(idx + direction, 0), steps.count - 1)
         liveCaching = steps[newIdx]
         startPlayback()
-    }
-
-    private func tick() {
-        let p = controller.player
-        if p.isPlaying { connecting = false }
     }
 
     private var liveControls: some View {
@@ -994,3 +1129,5 @@ struct PlayerView: View {
         .background(Color.black.opacity(0.65))
     }
 }
+
+// END OF FILE
