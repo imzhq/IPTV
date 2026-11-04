@@ -3,7 +3,6 @@ import UIKit
 import AVFoundation
 import AVKit
 import MobileVLCKit
-import KSPlayer
 
 // MARK: - Models
 
@@ -329,11 +328,13 @@ class IPTVViewModel: ObservableObject {
     }
 
     func movieURL(_ item: MediaItem) -> URL? {
-        URL(string: "\(baseURL)/movie/\(u)/\(p)/\(item.id).\(item.ext)")
+        // Force .mp4 container endpoint so Xtream remuxes on-the-fly for Apple AVPlayer & Native PiP compatibility
+        URL(string: "\(baseURL)/movie/\(u)/\(p)/\(item.id).mp4")
     }
 
     func episodeURL(_ ep: Episode) -> URL? {
-        URL(string: "\(baseURL)/series/\(u)/\(p)/\(ep.id).\(ep.ext)")
+        // Force .mp4 container endpoint for series/novels to enable native PiP
+        URL(string: "\(baseURL)/series/\(u)/\(p)/\(ep.id).mp4")
     }
 
     func logout() {
@@ -620,7 +621,7 @@ struct ItemDestination: View {
         case .live:
             LivePlayerView(title: item.name, url: model.liveURL(item))
         case .movies:
-            KSPlayerVODView(title: item.name, url: model.movieURL(item))
+            MoviePlayerView(title: item.name, url: model.movieURL(item))
         case .series:
             EpisodeListView(model: model, series: item)
         }
@@ -747,7 +748,7 @@ struct EpisodeListView: View {
                 ScrollView {
                     LazyVStack(spacing: 10) {
                         ForEach(episodes) { ep in
-                            NavigationLink(destination: KSPlayerVODView(title: ep.title, url: model.episodeURL(ep))) {
+                            NavigationLink(destination: MoviePlayerView(title: ep.title, url: model.episodeURL(ep))) {
                                 MediaRow(name: "S\(ep.season) E\(ep.number) · \(ep.title)", icon: nil, symbol: "play.fill", showIcon: false)
                             }
                         }
@@ -765,75 +766,102 @@ struct EpisodeListView: View {
     }
 }
 
-// MARK: - KSPlayer VOD View (Supports .mkv, custom codecs, and system-wide PiP)
+// MARK: - Native Player Model & View (Supports Full Native PiP)
 
-struct KSPlayerVODView: View {
+final class NativePlayerModel: ObservableObject {
+    @Published var failed = false
+    @Published var errorText = ""
+    let player = AVPlayer()
+
+    private var statusObserver: NSKeyValueObservation?
+    private var started = false
+
+    func start(url: URL, dataSaver: Bool) {
+        guard !started else { return }
+        started = true
+        failed = false
+
+        let item = AVPlayerItem(url: url)
+        if dataSaver {
+            item.preferredForwardBufferDuration = 5
+            item.preferredMaximumResolution = CGSize(width: 1280, height: 720)
+            item.preferredPeakBitRate = 3_000_000
+        }
+        statusObserver = item.observe(\.status, options: [.new]) { [weak self] observed, _ in
+            DispatchQueue.main.async {
+                if observed.status == .failed {
+                    self?.errorText = observed.error?.localizedDescription ?? "Unknown error"
+                    self?.failed = true
+                }
+            }
+        }
+        player.replaceCurrentItem(with: item)
+        player.play()
+    }
+
+    func stop() {
+        statusObserver = nil
+        player.pause()
+        player.replaceCurrentItem(with: nil)
+        started = false
+    }
+}
+
+struct NativeVideoPlayer: UIViewControllerRepresentable {
+    let player: AVPlayer
+
+    func makeUIViewController(context: Context) -> AVPlayerViewController {
+        let vc = AVPlayerViewController()
+        vc.player = player
+        vc.allowsPictureInPicturePlayback = true
+        vc.canStartPictureInPictureAutomaticallyFromInline = true
+        vc.entersFullScreenWhenPlaybackBegins = false
+        return vc
+    }
+
+    func updateUIViewController(_ uiViewController: AVPlayerViewController, context: Context) {}
+}
+
+struct MoviePlayerView: View {
     let title: String
     let url: URL?
 
-    @Environment(\.presentationMode) var presentationMode
-    @State private var showControls = true
     @AppStorage("data_saver") private var dataSaver = true
-    @StateObject private var coordinator = KSVideoPlayer.Coordinator()
+    @StateObject private var model = NativePlayerModel()
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-
             if let url = url {
-                // KSPlayer initialized correctly with coordinator, url, and options
-                KSVideoPlayer(coordinator: coordinator, url: url, options: KSOptions())
-                    .edgesIgnoringSafeArea(.all)
-                    .onAppear {
-                        if dataSaver {
-                            // Enforce custom buffer/bitrate options if configured
-                        }
+                NativeVideoPlayer(player: model.player)
+                    .ignoresSafeArea(edges: .bottom)
+                if model.failed {
+                    VStack(spacing: 10) {
+                        Text("Stream unavailable")
+                            .font(.headline)
+                            .foregroundColor(.white)
+                        Text(model.errorText)
+                            .font(.caption)
+                            .foregroundColor(.gray)
                     }
-
-                Rectangle()
-                    .fill(Color.clear)
-                    .contentShape(Rectangle())
-                    .edgesIgnoringSafeArea(.all)
-                    .onTapGesture {
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            showControls.toggle()
-                        }
-                    }
+                    .padding()
+                }
             } else {
                 Text("Could not build stream URL").foregroundColor(.red)
             }
-
-            if showControls && url != nil {
-                VStack {
-                    HStack(spacing: 15) {
-                        Button(action: { presentationMode.wrappedValue.dismiss() }) {
-                            Image(systemName: "chevron.left")
-                                .font(.title3.weight(.semibold))
-                                .foregroundColor(.white)
-                        }
-                        
-                        Text(title)
-                            .font(.headline)
-                            .foregroundColor(.white)
-                            .lineLimit(1)
-                        
-                        Spacer()
-                    }
-                    .padding()
-                    .background(Color.black.opacity(0.65))
-                    
-                    Spacer()
-                }
-                .transition(.opacity)
-            }
         }
-        .navigationBarHidden(true)
+        .navigationBarTitle(title, displayMode: .inline)
+        .navigationBarHidden(false)
         .onAppear {
             try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
             try? AVAudioSession.sharedInstance().setActive(true)
             UIApplication.shared.isIdleTimerDisabled = true
+            if let url = url {
+                model.start(url: url, dataSaver: dataSaver)
+            }
         }
         .onDisappear {
+            model.stop()
             UIApplication.shared.isIdleTimerDisabled = false
         }
     }
