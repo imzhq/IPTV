@@ -23,7 +23,6 @@ targets:
       properties:
         CFBundleDisplayName: LeanIPTV
         UILaunchScreen: {}
-        UIBackgroundModes:
-          - audio
+        UIBackgroundModes: [audio]
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
