@@ -1,3 +1,6 @@
+Look at that PiP window in the corner — it is actually playing right there, but the main screen is throwing a "Stream unavailable" error because the .mp4 container override forced an unsupported path on that specific episode stream!
+Since some Xtream server nodes reject forced .mp4 extensions on container files or throw a network error when they can't remux on the fly, the clean fix is to fall back to the episode's original container extension (ep.ext) while retaining the native AVPlayer framework so PiP stays wide open. If an item fails or throws an unavailable message, we can give it a seamless fallback button to switch over to VLC right on the screen.
+Here is your updated, fully integrated ContentView.swift with the original container extension restoration and native PiP stability:
 import SwiftUI
 import UIKit
 import AVFoundation
@@ -328,13 +331,11 @@ class IPTVViewModel: ObservableObject {
     }
 
     func movieURL(_ item: MediaItem) -> URL? {
-        // Force .mp4 container endpoint so Xtream remuxes on-the-fly for Apple AVPlayer & Native PiP compatibility
-        URL(string: "\(baseURL)/movie/\(u)/\(p)/\(item.id).mp4")
+        URL(string: "\(baseURL)/movie/\(u)/\(p)/\(item.id).\(item.ext)")
     }
 
     func episodeURL(_ ep: Episode) -> URL? {
-        // Force .mp4 container endpoint for series/novels to enable native PiP
-        URL(string: "\(baseURL)/series/\(u)/\(p)/\(ep.id).mp4")
+        URL(string: "\(baseURL)/series/\(u)/\(p)/\(ep.id).\(ep.ext)")
     }
 
     func logout() {
@@ -766,7 +767,7 @@ struct EpisodeListView: View {
     }
 }
 
-// MARK: - Native Player Model & View (Supports Full Native PiP)
+// MARK: - Native Player Model & View with VLC Fallback
 
 final class NativePlayerModel: ObservableObject {
     @Published var failed = false
@@ -790,7 +791,7 @@ final class NativePlayerModel: ObservableObject {
         statusObserver = item.observe(\.status, options: [.new]) { [weak self] observed, _ in
             DispatchQueue.main.async {
                 if observed.status == .failed {
-                    self?.errorText = observed.error?.localizedDescription ?? "Unknown error"
+                    self?.errorText = observed.error?.localizedDescription ?? "Format or network error"
                     self?.failed = true
                 }
             }
@@ -828,23 +829,20 @@ struct MoviePlayerView: View {
 
     @AppStorage("data_saver") private var dataSaver = true
     @StateObject private var model = NativePlayerModel()
+    @State private var useVLC = false
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
             if let url = url {
-                NativeVideoPlayer(player: model.player)
-                    .ignoresSafeArea(edges: .bottom)
-                if model.failed {
-                    VStack(spacing: 10) {
-                        Text("Stream unavailable")
-                            .font(.headline)
-                            .foregroundColor(.white)
-                        Text(model.errorText)
-                            .font(.caption)
-                            .foregroundColor(.gray)
+                if useVLC {
+                    VLCMovieView(url: url, dataSaver: dataSaver)
+                } else {
+                    NativeVideoPlayer(player: model.player)
+                        .ignoresSafeArea(edges: .bottom)
+                    if model.failed {
+                        failureOverlay
                     }
-                    .padding()
                 }
             } else {
                 Text("Could not build stream URL").foregroundColor(.red)
@@ -856,7 +854,7 @@ struct MoviePlayerView: View {
             try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
             try? AVAudioSession.sharedInstance().setActive(true)
             UIApplication.shared.isIdleTimerDisabled = true
-            if let url = url {
+            if let url = url, !useVLC {
                 model.start(url: url, dataSaver: dataSaver)
             }
         }
@@ -864,6 +862,100 @@ struct MoviePlayerView: View {
             model.stop()
             UIApplication.shared.isIdleTimerDisabled = false
         }
+    }
+
+    private var failureOverlay: some View {
+        VStack(spacing: 12) {
+            Text("Stream unavailable")
+                .font(.headline)
+                .foregroundColor(.white)
+            Text("This format (.mkv or custom codec) requires VLC fallback.")
+                .font(.caption)
+                .foregroundColor(.gray)
+                .multilineTextAlignment(.center)
+            Button(action: {
+                model.stop()
+                useVLC = true
+            }) {
+                Text("Play with VLC")
+                    .font(.footnote.weight(.semibold))
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .background(Color.red.opacity(0.85))
+                    .foregroundColor(.white)
+                    .cornerRadius(10)
+            }
+        }
+        .padding()
+        .background(Color.black.opacity(0.85))
+        .cornerRadius(12)
+        .padding()
+    }
+}
+
+// MARK: - VLC Fallback View
+
+struct VLCMovieView: View {
+    let url: URL
+    let dataSaver: Bool
+
+    @StateObject private var controller = VLCController()
+    @State private var connecting = true
+    @State private var progress: Double = 0
+    @State private var scrubbing = false
+    @State private var playing = true
+    @State private var elapsed = "0:00"
+    @State private var total = "0:00"
+
+    private let poll = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        ZStack(alignment: .bottom) {
+            VLCSurface(controller: controller, onReady: { startPlayback() })
+                .ignoresSafeArea(edges: .bottom)
+
+            if connecting {
+                ProgressView()
+                    .scaleEffect(1.2)
+                    .frame(maxHeight: .infinity)
+            }
+
+            controls
+        }
+        .onDisappear { controller.stop() }
+        .onReceive(poll) { _ in tick() }
+    }
+
+    private func startPlayback() {
+        connecting = true
+        controller.start(url: url, options: [":network-caching=\(dataSaver ? 1500 : 4000)"])
+    }
+
+    private func tick() {
+        let p = controller.player
+        playing = p.isPlaying
+        if p.isPlaying { connecting = false }
+        if !scrubbing {
+            progress = Double(p.position)
+            elapsed = clock(Int(p.time.intValue))
+            total = clock(Int(p.media?.length.intValue ?? 0))
+        }
+    }
+
+    private var controls: some View {
+        VStack(spacing: 6) {
+            Slider(value: $progress, in: 0...1, onEditingChanged: { editing in
+                scrubbing = editing
+                if !editing { controller.player.position = Float(progress) }
+            })
+            HStack {
+                Text(elapsed).font(.caption2).foregroundColor(.white)
+                Spacer()
+                Text(total).font(.caption2).foregroundColor(.white)
+            }
+        }
+        .padding(12)
+        .background(Color.black.opacity(0.65))
     }
 }
 
@@ -1022,3 +1114,4 @@ struct LivePlayerView: View {
         .background(Color.black.opacity(0.65))
     }
 }
+
