@@ -2,7 +2,6 @@ import SwiftUI
 import UIKit
 import AVFoundation
 import KSPlayer
-import MobileVLCKit
 
 // MARK: - Models
 
@@ -784,7 +783,9 @@ enum KSPlayerSetup {
 struct KSPlayerContainer: UIViewRepresentable {
     let url: URL
     let title: String
-    let dataSaver: Bool
+    var dataSaver: Bool = false
+    var live: Bool = false
+    var liveBufferSeconds: Double = 1.5
     let onBack: () -> Void
 
     func makeUIView(context: Context) -> IOSVideoPlayerView {
@@ -792,7 +793,11 @@ struct KSPlayerContainer: UIViewRepresentable {
 
         let options = KSOptions()
         options.userAgent = "Mozilla/5.0"
-        if dataSaver {
+        if live {
+            options.formatContextOptions["fflags"] = "nobuffer"
+            options.preferredForwardBufferDuration = liveBufferSeconds
+            options.maxBufferDuration = max(liveBufferSeconds * 4, 5)
+        } else if dataSaver {
             options.preferredForwardBufferDuration = 3
             options.maxBufferDuration = 30
         }
@@ -843,106 +848,32 @@ struct MoviePlayerView: View {
     }
 }
 
-// MARK: - Live TV Player (VLC, Low Delay)
-
-final class VLCController: ObservableObject {
-    let player = VLCMediaPlayer()
-
-    func start(url: URL, options: [String]) {
-        player.stop()
-        let media = VLCMedia(url: url)
-        for o in options { media.addOption(o) }
-        player.media = media
-        player.play()
-    }
-
-    func stop() {
-        player.stop()
-    }
-}
-
-struct VLCSurface: UIViewRepresentable {
-    let controller: VLCController
-    let onReady: () -> Void
-
-    func makeUIView(context: Context) -> UIView {
-        let view = UIView()
-        view.backgroundColor = .black
-        controller.player.drawable = view
-        DispatchQueue.main.async { onReady() }
-        return view
-    }
-
-    func updateUIView(_ uiView: UIView, context: Context) {}
-}
+// MARK: - Live TV Player (KSPlayer, low delay)
 
 struct LivePlayerView: View {
     let title: String
     let url: URL?
 
     @AppStorage("live_caching") private var liveCaching = 1500
-
-    @StateObject private var controller = VLCController()
-    @State private var connecting = true
-    @State private var showControls = true
-
     @Environment(\.presentationMode) var presentationMode
 
     private let steps = [300, 500, 800, 1200, 1500, 2000, 3000, 5000]
-    private let poll = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-
-            if url != nil {
-                VLCSurface(controller: controller, onReady: { startPlayback() })
-                    .ignoresSafeArea()
-
-                Rectangle()
-                    .fill(Color.clear)
-                    .contentShape(Rectangle())
-                    .ignoresSafeArea()
-                    .onTapGesture {
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            showControls.toggle()
-                        }
-                    }
-            } else {
-                Text("Could not build stream URL").foregroundColor(.red)
-            }
-
-            if connecting && url != nil {
-                VStack(spacing: 10) {
-                    ProgressView().scaleEffect(1.2)
-                    Text("Connecting...").font(.subheadline).foregroundColor(.gray)
-                }
-            }
-
-            if showControls && url != nil {
-                VStack {
-                    HStack(spacing: 15) {
-                        Button(action: { presentationMode.wrappedValue.dismiss() }) {
-                            Image(systemName: "chevron.left")
-                                .font(.title3.weight(.semibold))
-                                .foregroundColor(.white)
-                        }
-
-                        Text(title)
-                            .font(.headline)
-                            .foregroundColor(.white)
-                            .lineLimit(1)
-
-                        Spacer()
-                    }
-                    .padding()
-                    .background(Color.black.opacity(0.65))
-
-                    Spacer()
-
+            if let url = url {
+                VStack(spacing: 0) {
+                    KSPlayerContainer(url: url,
+                                      title: title,
+                                      live: true,
+                                      liveBufferSeconds: Double(liveCaching) / 1000,
+                                      onBack: { presentationMode.wrappedValue.dismiss() })
+                        .id(liveCaching)   // recreate the player when the buffer changes
                     liveControls
                 }
-                .transition(.opacity)
+            } else {
+                Text("Could not build stream URL").foregroundColor(.red)
             }
         }
         .navigationBarHidden(true)
@@ -952,29 +883,14 @@ struct LivePlayerView: View {
             UIApplication.shared.isIdleTimerDisabled = true
         }
         .onDisappear {
-            controller.stop()
             UIApplication.shared.isIdleTimerDisabled = false
         }
-        .onReceive(poll) { _ in
-            if controller.player.isPlaying { connecting = false }
-        }
-    }
-
-    private func startPlayback() {
-        guard let url = url else { return }
-        connecting = true
-        let opts = [":network-caching=\(liveCaching)",
-                    ":live-caching=\(liveCaching)",
-                    ":clock-jitter=0",
-                    ":clock-synchro=0"]
-        controller.start(url: url, options: opts)
     }
 
     private func changeBuffer(by direction: Int) {
         let idx = steps.firstIndex(where: { $0 >= liveCaching }) ?? (steps.count - 1)
         let newIdx = min(max(idx + direction, 0), steps.count - 1)
         liveCaching = steps[newIdx]
-        startPlayback()
     }
 
     private var liveControls: some View {
