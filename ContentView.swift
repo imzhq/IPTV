@@ -1,10 +1,7 @@
-Look at that PiP window in the corner — it is actually playing right there, but the main screen is throwing a "Stream unavailable" error because the .mp4 container override forced an unsupported path on that specific episode stream!
-Since some Xtream server nodes reject forced .mp4 extensions on container files or throw a network error when they can't remux on the fly, the clean fix is to fall back to the episode's original container extension (ep.ext) while retaining the native AVPlayer framework so PiP stays wide open. If an item fails or throws an unavailable message, we can give it a seamless fallback button to switch over to VLC right on the screen.
-Here is your updated, fully integrated ContentView.swift with the original container extension restoration and native PiP stability:
 import SwiftUI
 import UIKit
 import AVFoundation
-import AVKit
+import KSPlayer
 import MobileVLCKit
 
 // MARK: - Models
@@ -43,7 +40,7 @@ struct IPTVCategory: Codable, Identifiable {
         }
         categoryName = (try? c.decode(String.self, forKey: .categoryName)) ?? "Unnamed"
     }
-    
+
     init(categoryId: String, categoryName: String) {
         self.categoryId = categoryId
         self.categoryName = categoryName
@@ -408,7 +405,7 @@ struct LoginView: View {
             .disabled(model.isLoading || model.host.isEmpty || model.username.isEmpty || model.password.isEmpty)
 
             Spacer()
-            
+
             Text("Note: Cache resets weekly to keep your device lean. Credentials are saved.")
                 .font(.caption2)
                 .foregroundColor(.gray)
@@ -767,60 +764,51 @@ struct EpisodeListView: View {
     }
 }
 
-// MARK: - Native Player Model & View with VLC Fallback
+// MARK: - Movies & Episodes (KSPlayer: MKV + Picture in Picture)
 
-final class NativePlayerModel: ObservableObject {
-    @Published var failed = false
-    @Published var errorText = ""
-    let player = AVPlayer()
+enum KSPlayerSetup {
+    private static var done = false
 
-    private var statusObserver: NSKeyValueObservation?
-    private var started = false
-
-    func start(url: URL, dataSaver: Bool) {
-        guard !started else { return }
-        started = true
-        failed = false
-
-        let item = AVPlayerItem(url: url)
-        if dataSaver {
-            item.preferredForwardBufferDuration = 5
-            item.preferredMaximumResolution = CGSize(width: 1280, height: 720)
-            item.preferredPeakBitRate = 3_000_000
-        }
-        statusObserver = item.observe(\.status, options: [.new]) { [weak self] observed, _ in
-            DispatchQueue.main.async {
-                if observed.status == .failed {
-                    self?.errorText = observed.error?.localizedDescription ?? "Format or network error"
-                    self?.failed = true
-                }
-            }
-        }
-        player.replaceCurrentItem(with: item)
-        player.play()
-    }
-
-    func stop() {
-        statusObserver = nil
-        player.pause()
-        player.replaceCurrentItem(with: nil)
-        started = false
+    /// Call once before creating any KSPlayer view.
+    static func configure() {
+        guard !done else { return }
+        done = true
+        // KSMEPlayer = FFmpeg based. Plays MKV and other containers, and supports PiP.
+        KSOptions.firstPlayerType = KSMEPlayer.self
+        KSOptions.secondPlayerType = nil
+        KSOptions.canStartPictureInPictureAutomaticallyFromInline = true
+        KSOptions.isAutoPlay = true
     }
 }
 
-struct NativeVideoPlayer: UIViewControllerRepresentable {
-    let player: AVPlayer
+struct KSPlayerContainer: UIViewRepresentable {
+    let url: URL
+    let title: String
+    let dataSaver: Bool
+    let onBack: () -> Void
 
-    func makeUIViewController(context: Context) -> AVPlayerViewController {
-        let vc = AVPlayerViewController()
-        vc.player = player
-        vc.allowsPictureInPicturePlayback = true
-        vc.canStartPictureInPictureAutomaticallyFromInline = true
-        vc.entersFullScreenWhenPlaybackBegins = false
-        return vc
+    func makeUIView(context: Context) -> IOSVideoPlayerView {
+        KSPlayerSetup.configure()
+
+        let options = KSOptions()
+        options.userAgent = "Mozilla/5.0"
+        if dataSaver {
+            options.preferredForwardBufferDuration = 3
+            options.maxBufferDuration = 30
+        }
+
+        let view = IOSVideoPlayerView()
+        view.backBlock = { onBack() }
+        view.set(resource: KSPlayerResource(url: url, options: options, name: title))
+        return view
     }
 
-    func updateUIViewController(_ uiViewController: AVPlayerViewController, context: Context) {}
+    func updateUIView(_ uiView: IOSVideoPlayerView, context: Context) {}
+
+    static func dismantleUIView(_ uiView: IOSVideoPlayerView, coordinator: ()) {
+        uiView.pause()
+        uiView.resetPlayer()
+    }
 }
 
 struct MoviePlayerView: View {
@@ -828,134 +816,30 @@ struct MoviePlayerView: View {
     let url: URL?
 
     @AppStorage("data_saver") private var dataSaver = true
-    @StateObject private var model = NativePlayerModel()
-    @State private var useVLC = false
+    @Environment(\.presentationMode) var presentationMode
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
             if let url = url {
-                if useVLC {
-                    VLCMovieView(url: url, dataSaver: dataSaver)
-                } else {
-                    NativeVideoPlayer(player: model.player)
-                        .ignoresSafeArea(edges: .bottom)
-                    if model.failed {
-                        failureOverlay
-                    }
-                }
+                KSPlayerContainer(url: url,
+                                  title: title,
+                                  dataSaver: dataSaver,
+                                  onBack: { presentationMode.wrappedValue.dismiss() })
+                    .ignoresSafeArea()
             } else {
                 Text("Could not build stream URL").foregroundColor(.red)
             }
         }
-        .navigationBarTitle(title, displayMode: .inline)
-        .navigationBarHidden(false)
+        .navigationBarHidden(true)
         .onAppear {
             try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
             try? AVAudioSession.sharedInstance().setActive(true)
             UIApplication.shared.isIdleTimerDisabled = true
-            if let url = url, !useVLC {
-                model.start(url: url, dataSaver: dataSaver)
-            }
         }
         .onDisappear {
-            model.stop()
             UIApplication.shared.isIdleTimerDisabled = false
         }
-    }
-
-    private var failureOverlay: some View {
-        VStack(spacing: 12) {
-            Text("Stream unavailable")
-                .font(.headline)
-                .foregroundColor(.white)
-            Text("This format (.mkv or custom codec) requires VLC fallback.")
-                .font(.caption)
-                .foregroundColor(.gray)
-                .multilineTextAlignment(.center)
-            Button(action: {
-                model.stop()
-                useVLC = true
-            }) {
-                Text("Play with VLC")
-                    .font(.footnote.weight(.semibold))
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
-                    .background(Color.red.opacity(0.85))
-                    .foregroundColor(.white)
-                    .cornerRadius(10)
-            }
-        }
-        .padding()
-        .background(Color.black.opacity(0.85))
-        .cornerRadius(12)
-        .padding()
-    }
-}
-
-// MARK: - VLC Fallback View
-
-struct VLCMovieView: View {
-    let url: URL
-    let dataSaver: Bool
-
-    @StateObject private var controller = VLCController()
-    @State private var connecting = true
-    @State private var progress: Double = 0
-    @State private var scrubbing = false
-    @State private var playing = true
-    @State private var elapsed = "0:00"
-    @State private var total = "0:00"
-
-    private let poll = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
-
-    var body: some View {
-        ZStack(alignment: .bottom) {
-            VLCSurface(controller: controller, onReady: { startPlayback() })
-                .ignoresSafeArea(edges: .bottom)
-
-            if connecting {
-                ProgressView()
-                    .scaleEffect(1.2)
-                    .frame(maxHeight: .infinity)
-            }
-
-            controls
-        }
-        .onDisappear { controller.stop() }
-        .onReceive(poll) { _ in tick() }
-    }
-
-    private func startPlayback() {
-        connecting = true
-        controller.start(url: url, options: [":network-caching=\(dataSaver ? 1500 : 4000)"])
-    }
-
-    private func tick() {
-        let p = controller.player
-        playing = p.isPlaying
-        if p.isPlaying { connecting = false }
-        if !scrubbing {
-            progress = Double(p.position)
-            elapsed = clock(Int(p.time.intValue))
-            total = clock(Int(p.media?.length.intValue ?? 0))
-        }
-    }
-
-    private var controls: some View {
-        VStack(spacing: 6) {
-            Slider(value: $progress, in: 0...1, onEditingChanged: { editing in
-                scrubbing = editing
-                if !editing { controller.player.position = Float(progress) }
-            })
-            HStack {
-                Text(elapsed).font(.caption2).foregroundColor(.white)
-                Spacer()
-                Text(total).font(.caption2).foregroundColor(.white)
-            }
-        }
-        .padding(12)
-        .background(Color.black.opacity(0.65))
     }
 }
 
@@ -1114,4 +998,3 @@ struct LivePlayerView: View {
         .background(Color.black.opacity(0.65))
     }
 }
-
