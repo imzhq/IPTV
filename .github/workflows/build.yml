@@ -1,4 +1,4 @@
-name: Build iOS App
+name: Build iOS
 
 on:
   push:
@@ -8,56 +8,39 @@ on:
 jobs:
   build:
     runs-on: macos-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Install CocoaPods dependencies
-        run: pod install
-
-      - name: Build
+      - name: Resolve Swift packages
         run: |
-          xcodebuild -workspace YourApp.xcworkspace \
-            -scheme YourApp \
+          xcodebuild -resolvePackageDependencies \
+            -project LeanIPTV.xcodeproj \
+            -scheme LeanIPTV
+
+      - name: Build (unsigned)
+        run: |
+          xcodebuild \
+            -project LeanIPTV.xcodeproj \
+            -scheme LeanIPTV \
             -configuration Release \
             -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
             build
 
-    - name: Set up Xcode
-      uses: maxim-lobanov/setup-xcode@v1
-      with:
-        xcode-version: latest
+      - name: Package IPA
+        run: |
+          mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/LeanIPTV.app Payload/
+          zip -r LeanIPTV.ipa Payload
 
-    - name: Install XcodeGen
-      run: brew install xcodegen
-
-    - name: Generate project and install VLC
-      run: |
-        xcodegen generate
-        pod install
-
-    - name: Build app (unsigned)
-      run: |
-        xcodebuild \
-          -workspace LeanIPTV.xcworkspace \
-          -scheme LeanIPTV \
-          -configuration Release \
-          -sdk iphoneos \
-          -destination 'generic/platform=iOS' \
-          -derivedDataPath build \
-          CODE_SIGNING_ALLOWED=NO \
-          CODE_SIGNING_REQUIRED=NO \
-          CODE_SIGN_IDENTITY="" \
-          build
-
-    - name: Package IPA
-      run: |
-        mkdir -p Payload
-        cp -R build/Build/Products/Release-iphoneos/LeanIPTV.app Payload/
-        zip -r LeanIPTV.app.ipa Payload
-
-    - name: Upload IPA Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: LeanIPTV-IPA
-        path: LeanIPTV.app.ipa
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeanIPTV-ipa
+          path: LeanIPTV.ipa
