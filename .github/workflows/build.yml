@@ -9,11 +9,19 @@ jobs:
   build:
     runs-on: macos-latest
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-     - name: Install CocoaPods dependencies
+      - name: Install CocoaPods dependencies
         run: pod install
+
+      - name: Build
+        run: |
+          xcodebuild -workspace YourApp.xcworkspace \
+            -scheme YourApp \
+            -configuration Release \
+            -sdk iphoneos \
+            CODE_SIGNING_ALLOWED=NO \
+            build
 
     - name: Set up Xcode
       uses: maxim-lobanov/setup-xcode@v1
