@@ -1,6 +1,7 @@
 import SwiftUI
 import UIKit
 import AVFoundation
+import AVKit
 import KSPlayer
 
 // MARK: - Models
@@ -326,6 +327,10 @@ class IPTVViewModel: ObservableObject {
         URL(string: "\(baseURL)/live/\(u)/\(p)/\(item.id).ts")
     }
 
+    func liveHLSURL(_ item: MediaItem) -> URL? {
+        URL(string: "\(baseURL)/live/\(u)/\(p)/\(item.id).m3u8")
+    }
+
     func movieURL(_ item: MediaItem) -> URL? {
         URL(string: "\(baseURL)/movie/\(u)/\(p)/\(item.id).\(item.ext)")
     }
@@ -616,7 +621,7 @@ struct ItemDestination: View {
     var body: some View {
         switch kind {
         case .live:
-            LivePlayerView(title: item.name, url: model.liveURL(item))
+            LivePlayerView(title: item.name, url: model.liveURL(item), hlsURL: model.liveHLSURL(item))
         case .movies:
             MoviePlayerView(title: item.name, url: model.movieURL(item))
         case .series:
@@ -794,9 +799,17 @@ struct KSPlayerContainer: UIViewRepresentable {
         let options = KSOptions()
         options.userAgent = "Mozilla/5.0"
         if live {
-            options.formatContextOptions["fflags"] = "nobuffer"
+            // Low-latency FFmpeg demuxer settings (values as strings so FFmpeg accepts them)
+            options.formatContextOptions["fflags"] = "nobuffer+discardcorrupt"
+            options.formatContextOptions["flags"] = "low_delay"
+            options.formatContextOptions["probesize"] = "200000"        // bytes to probe
+            options.formatContextOptions["analyzeduration"] = "500000"  // microseconds
+            options.formatContextOptions["max_delay"] = "0"
+            options.formatContextOptions["reconnect"] = "1"
+            options.formatContextOptions["reconnect_streamed"] = "1"
+            options.formatContextOptions["reconnect_delay_max"] = "2"
             options.preferredForwardBufferDuration = liveBufferSeconds
-            options.maxBufferDuration = max(liveBufferSeconds * 4, 5)
+            options.maxBufferDuration = max(liveBufferSeconds * 2, 2)
         } else if dataSaver {
             options.preferredForwardBufferDuration = 3
             options.maxBufferDuration = 30
@@ -848,30 +861,88 @@ struct MoviePlayerView: View {
     }
 }
 
-// MARK: - Live TV Player (KSPlayer, low delay)
+// MARK: - Live TV Player (AVPlayer HLS with live-edge tracking, KSPlayer .ts fallback)
+
+final class LiveHLSModel: ObservableObject {
+    @Published var failed = false
+    let player = AVPlayer()
+
+    private var observer: NSKeyValueObservation?
+    private var started = false
+
+    func start(url: URL) {
+        guard !started else { return }
+        started = true
+        failed = false
+
+        let item = AVPlayerItem(url: url)
+        item.preferredForwardBufferDuration = 2
+        // Keep playback pinned near the live edge (speeds up slightly to catch up)
+        item.automaticallyPreservesTimeOffsetFromLive = true
+        item.configuredTimeOffsetFromLive = CMTime(seconds: 3, preferredTimescale: 600)
+        player.automaticallyWaitsToMinimizeStalling = false
+
+        observer = item.observe(\.status, options: [.new]) { [weak self] observed, _ in
+            DispatchQueue.main.async {
+                if observed.status == .failed { self?.failed = true }
+            }
+        }
+        player.replaceCurrentItem(with: item)
+        player.play()
+    }
+
+    func jumpToLive() {
+        guard let item = player.currentItem,
+              let range = item.seekableTimeRanges.last?.timeRangeValue else { return }
+        player.seek(to: range.end, toleranceBefore: .zero, toleranceAfter: .zero)
+        player.play()
+    }
+
+    func stop() {
+        observer = nil
+        player.pause()
+        player.replaceCurrentItem(with: nil)
+        started = false
+    }
+}
+
+struct LiveAVPlayer: UIViewControllerRepresentable {
+    let player: AVPlayer
+
+    func makeUIViewController(context: Context) -> AVPlayerViewController {
+        let vc = AVPlayerViewController()
+        vc.player = player
+        vc.allowsPictureInPicturePlayback = true
+        vc.canStartPictureInPictureAutomaticallyFromInline = true
+        vc.entersFullScreenWhenPlaybackBegins = false
+        return vc
+    }
+
+    func updateUIViewController(_ uiViewController: AVPlayerViewController, context: Context) {}
+}
 
 struct LivePlayerView: View {
     let title: String
-    let url: URL?
+    let url: URL?      // .ts stream (KSPlayer fallback)
+    let hlsURL: URL?   // .m3u8 stream (AVPlayer)
 
     @AppStorage("live_caching") private var liveCaching = 1500
+    @StateObject private var hls = LiveHLSModel()
+    @State private var useTS = false
+    @State private var reloadToken = 0
     @Environment(\.presentationMode) var presentationMode
 
     private let steps = [300, 500, 800, 1200, 1500, 2000, 3000, 5000]
 
+    private var usingHLS: Bool { !useTS && hlsURL != nil }
+
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            if let url = url {
-                VStack(spacing: 0) {
-                    KSPlayerContainer(url: url,
-                                      title: title,
-                                      live: true,
-                                      liveBufferSeconds: Double(liveCaching) / 1000,
-                                      onBack: { presentationMode.wrappedValue.dismiss() })
-                        .id(liveCaching)   // recreate the player when the buffer changes
-                    liveControls
-                }
+            if usingHLS, let hlsURL = hlsURL {
+                hlsLayout(hlsURL)
+            } else if let url = url {
+                tsLayout(url)
             } else {
                 Text("Could not build stream URL").foregroundColor(.red)
             }
@@ -881,9 +952,91 @@ struct LivePlayerView: View {
             try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
             try? AVAudioSession.sharedInstance().setActive(true)
             UIApplication.shared.isIdleTimerDisabled = true
+            if usingHLS, let hlsURL = hlsURL { hls.start(url: hlsURL) }
         }
         .onDisappear {
+            hls.stop()
             UIApplication.shared.isIdleTimerDisabled = false
+        }
+    }
+
+    // MARK: HLS (AVPlayer)
+
+    private func hlsLayout(_ hlsURL: URL) -> some View {
+        VStack(spacing: 0) {
+            ZStack(alignment: .topLeading) {
+                LiveAVPlayer(player: hls.player)
+
+                Button(action: { presentationMode.wrappedValue.dismiss() }) {
+                    Image(systemName: "chevron.left")
+                        .font(.title3.weight(.semibold))
+                        .foregroundColor(.white)
+                        .padding(12)
+                        .background(Color.black.opacity(0.55))
+                        .clipShape(Circle())
+                }
+                .padding(.leading, 12)
+                .padding(.top, 8)
+
+                if hls.failed {
+                    VStack(spacing: 12) {
+                        Text("HLS stream unavailable")
+                            .font(.headline).foregroundColor(.white)
+                        Text("Your provider may not support .m3u8 for this channel.")
+                            .font(.caption).foregroundColor(.gray)
+                            .multilineTextAlignment(.center)
+                        Button(action: {
+                            hls.stop()
+                            useTS = true
+                        }) {
+                            Text("Use .ts stream instead")
+                                .font(.footnote.weight(.semibold))
+                                .padding(.horizontal, 16).padding(.vertical, 10)
+                                .background(Color.red.opacity(0.85))
+                                .foregroundColor(.white)
+                                .cornerRadius(10)
+                        }
+                    }
+                    .padding()
+                    .background(Color.black.opacity(0.85))
+                    .cornerRadius(12)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+
+            VStack(spacing: 8) {
+                Text(title).font(.footnote).foregroundColor(.gray).lineLimit(1)
+                HStack(spacing: 12) {
+                    Button(action: { hls.jumpToLive() }) {
+                        Label("Jump to live", systemImage: "forward.end.fill")
+                    }
+                    Button(action: {
+                        hls.stop()
+                        useTS = true
+                    }) {
+                        Label("Use .ts", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                }
+                .font(.footnote.weight(.semibold))
+                .foregroundColor(.white)
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity)
+            .background(Color.black.opacity(0.65))
+        }
+    }
+
+    // MARK: .ts fallback (KSPlayer)
+
+    private func tsLayout(_ url: URL) -> some View {
+        VStack(spacing: 0) {
+            KSPlayerContainer(url: url,
+                              title: title,
+                              live: true,
+                              liveBufferSeconds: Double(liveCaching) / 1000,
+                              onBack: { presentationMode.wrappedValue.dismiss() })
+                .id("\(liveCaching)-\(reloadToken)")
+            tsControls
         }
     }
 
@@ -893,7 +1046,7 @@ struct LivePlayerView: View {
         liveCaching = steps[newIdx]
     }
 
-    private var liveControls: some View {
+    private var tsControls: some View {
         VStack(spacing: 8) {
             Text("Live buffer: " + String(format: "%.1f", Double(liveCaching) / 1000) + " s")
                 .font(.footnote.weight(.semibold))
@@ -904,6 +1057,9 @@ struct LivePlayerView: View {
                 }
                 Button(action: { changeBuffer(by: 1) }) {
                     Label("More stable", systemImage: "plus.circle")
+                }
+                Button(action: { reloadToken += 1 }) {
+                    Label("Jump to live", systemImage: "forward.end.fill")
                 }
             }
             .font(.footnote.weight(.semibold))
