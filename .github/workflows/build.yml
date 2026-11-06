@@ -13,6 +13,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Generate Xcode project
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
       - name: Resolve Swift packages
         run: |
           xcodebuild -resolvePackageDependencies \
@@ -35,8 +40,10 @@ jobs:
 
       - name: Package IPA
         run: |
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -n 1)
+          echo "Packaging: $APP"
           mkdir Payload
-          cp -R build/Build/Products/Release-iphoneos/LeanIPTV.app Payload/
+          cp -R "$APP" Payload/
           zip -r LeanIPTV.ipa Payload
 
       - name: Upload IPA
