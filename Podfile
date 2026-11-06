@@ -1,5 +1,5 @@
 platform :ios, '15.0'
+use_frameworks!
 
 target 'LeanIPTV' do
-  use_frameworks!
 end
