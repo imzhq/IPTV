@@ -8,4 +8,8 @@
     <true/>
 </dict>
 </dict>
+<key>UIBackgroundModes</key>
+<array>
+    <string>audio</string>
+</array>
 </plist>
